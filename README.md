@@ -63,6 +63,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **Keras**               | `.h5`, `.hdf5`, `.keras`              | MEDIUM |
 | **ONNX**                | `.onnx`                               | MEDIUM |
 | **CNTK**                | `.dnn`, `.cmf`                        | MEDIUM |
+| **RKNN**                | `.rknn`                               | MEDIUM |
 | **CatBoost**            | `.cbm`                                | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.ubj`              | MEDIUM |
 | **SafeTensors**         | `.safetensors`                        | LOW    |

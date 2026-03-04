@@ -158,6 +158,8 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
     match magic4:
         case b"CBM1":
             return "catboost"
+        case b"RKNN":
+            return "rknn"
         case b"GGUF":
             return "gguf"
         case magic if magic in GGML_MAGIC_VARIANTS:
@@ -422,6 +424,10 @@ def detect_file_format(path: str) -> str:
         if _is_cntk_signature(prefix):
             return "cntk"
         return "unknown"
+    if ext == ".rknn":
+        if magic4 == b"RKNN":
+            return "rknn"
+        return "rknn"
     if ext == ".cbm":
         return "catboost"
     if ext == ".h5":
@@ -494,6 +500,7 @@ EXTENSION_FORMAT_MAP = {
     ".ckpt": "pickle",
     ".dnn": "cntk",
     ".cmf": "cntk",
+    ".rknn": "rknn",
     ".pkl": "pickle",
     ".pickle": "pickle",
     ".dill": "pickle",
@@ -550,6 +557,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "pickle"
         case ".dnn" | ".cmf":
             return "cntk"
+        case ".rknn":
+            return "rknn"
         # HDF5 formats
         case ".h5" | ".hdf5":
             return "hdf5"
@@ -754,6 +763,9 @@ def validate_file_type(path: str) -> bool:
             cntk_prefix = read_magic_bytes(path, _CNTK_SIGNATURE_READ_BYTES)
             return _is_cntk_signature(cntk_prefix)
 
+        # RKNN files require RKNN signature bytes.
+        if ext_format == "rknn":
+            return header_format == "rknn"
 
         # R serialized workspace/data files may be uncompressed or wrapped;
         # extension-based intent is authoritative for static scanning.

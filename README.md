@@ -64,6 +64,7 @@ ModelAudit includes **30 specialized scanners** covering model, archive, and con
 | **ONNX**                | `.onnx`                               | MEDIUM |
 | **CNTK**                | `.dnn`, `.cmf`                        | MEDIUM |
 | **RKNN**                | `.rknn`                               | MEDIUM |
+| **Torch7**              | `.t7`, `.th`, `.net`                  | HIGH   |
 | **CatBoost**            | `.cbm`                                | MEDIUM |
 | **XGBoost**             | `.bst`, `.model`, `.ubj`              | MEDIUM |
 | **SafeTensors**         | `.safetensors`                        | LOW    |

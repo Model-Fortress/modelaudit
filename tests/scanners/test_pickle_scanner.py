@@ -628,6 +628,18 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 class TestPickleScannerBlocklistHardening(unittest.TestCase):
     """Regression tests for fickling/picklescan bypass hardening."""
 
+    PICKLESCAN_GAP_REFS = (
+        ("numpy", "load"),
+        ("site", "main"),
+        ("_io", "FileIO"),
+        ("test.support.script_helper", "assert_python_ok"),
+        ("_osx_support", "_read_output"),
+        ("_aix_support", "_read_cmd_output"),
+        ("_pyrepl.pager", "pipe_pager"),
+        ("torch.serialization", "load"),
+        ("torch._inductor.codecache", "compile_file"),
+    )
+
     @staticmethod
     def _craft_global_reduce_pickle(module: str, func: str) -> bytes:
         """Craft a minimal pickle that uses GLOBAL + REDUCE to call module.func.
@@ -644,6 +656,12 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         # MARK + empty TUPLE (arguments) + REDUCE + STOP
         call_ops = b"(" + b"t" + b"R" + b"."
         return proto + global_op + call_ops
+
+    @staticmethod
+    def _craft_global_only_pickle(module: str, func: str) -> bytes:
+        """Craft a minimal pickle with a bare GLOBAL reference and STOP."""
+
+        return b"\x80\x02" + b"c" + f"{module}\n{func}\n".encode() + b"."
 
     def _scan_bytes(self, data: bytes) -> ScanResult:
         import os
@@ -992,6 +1010,108 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert any(i.severity == IssueSeverity.CRITICAL and "webbrowser" in i.message for i in result.issues), (
             f"Expected CRITICAL webbrowser issue, got: {[i.message for i in result.issues]}"
         )
+
+    def test_picklescan_gap_globals_are_critical_on_import_only(self) -> None:
+        """Validated PickleScan dangerous globals should fail even without REDUCE."""
+        for module, func in self.PICKLESCAN_GAP_REFS:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            assert result.has_errors, f"Expected failing checks for {module}.{func}"
+            assert any(
+                check.name == "Global Module Reference Check"
+                and check.status == CheckStatus.FAILED
+                and check.severity == IssueSeverity.CRITICAL
+                and check.rule_code == "S206"
+                and f"{module}.{func}" in check.message
+                for check in result.checks
+            ), f"Expected CRITICAL global check for {module}.{func}, checks: {[c.message for c in result.checks]}"
+
+    def test_picklescan_gap_globals_are_critical_with_reduce(self) -> None:
+        """Validated PickleScan dangerous globals should fail as CRITICAL in REDUCE flows."""
+        for module, func in self.PICKLESCAN_GAP_REFS:
+            result = self._scan_bytes(self._craft_global_reduce_pickle(module, func))
+            assert result.has_errors, f"Expected failing checks for {module}.{func}"
+            assert any(
+                check.name == "REDUCE Opcode Safety Check"
+                and check.status == CheckStatus.FAILED
+                and check.severity == IssueSeverity.CRITICAL
+                and f"{module}.{func}" in check.message
+                for check in result.checks
+            ), f"Expected CRITICAL REDUCE check for {module}.{func}, checks: {[c.message for c in result.checks]}"
+            assert not any(
+                "non-allowlisted global" in check.message and f"{module}.{func}" in check.message
+                for check in result.checks
+                if check.name == "REDUCE Opcode Safety Check"
+            ), f"Dangerous global should not degrade to a generic warning for {module}.{func}"
+
+    def test_picklescan_gap_imports_use_exact_why_explanations(self) -> None:
+        """Exact dotted-name explanations should be used for new dangerous refs."""
+        result = self._scan_bytes(self._craft_global_only_pickle("numpy", "load"))
+
+        why_texts = [issue.why or "" for issue in result.issues if "numpy.load" in issue.message]
+        assert any("recursively deserialize object arrays" in why.lower() for why in why_texts), (
+            f"Expected exact numpy.load explanation, got: {why_texts}"
+        )
+
+    def test_safe_nearby_imports_remain_non_failing(self) -> None:
+        """Nearby safe imports should remain non-failing to avoid broad module false positives."""
+        for module, func in [("site", "addsitedir"), ("_io", "BytesIO"), ("torch", "Tensor"), ("numpy", "array")]:
+            result = self._scan_bytes(self._craft_global_only_pickle(module, func))
+            assert result.success
+            assert not any(
+                check.name == "Global Module Reference Check"
+                and check.status == CheckStatus.FAILED
+                and f"{module}.{func}" in check.message
+                for check in result.checks
+            ), f"Unexpected failing global check for safe reference {module}.{func}"
+
+    def test_existing_reference_behavior_unchanged(self) -> None:
+        """Existing dangerous references should remain failing after the expansion."""
+        for module, func in [
+            ("joblib", "load"),
+            ("pip", "main"),
+            ("pydoc", "pipepager"),
+            ("venv", "create"),
+        ]:
+            result = self._scan_bytes(self._craft_global_reduce_pickle(module, func))
+            assert result.has_errors, f"Expected existing dangerous behavior for {module}.{func}"
+
+    def test_picklescan_gap_detected_inside_zip_entry(self) -> None:
+        """Dangerous primitive inside a ZIP entry should be detected by archive scanning."""
+        import zipfile
+
+        from modelaudit.core import scan_file
+
+        payload = self._craft_global_reduce_pickle("numpy", "load")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zip_path = Path(tmp_dir) / "numpy_loader_payload.zip"
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("weights.pkl", payload)
+
+            result = scan_file(str(zip_path))
+
+            assert result.success
+            assert result.has_errors
+            assert any(
+                issue.severity == IssueSeverity.CRITICAL and "numpy.load" in issue.message for issue in result.issues
+            ), f"Expected CRITICAL numpy.load issue in zip entry, got: {[i.message for i in result.issues]}"
+
+    def test_picklescan_gap_detected_in_second_pickle_stream(self) -> None:
+        """Dangerous loader hidden in a second stream should still be detected."""
+        import io
+
+        buffer = io.BytesIO()
+        pickle.dump({"safe": True}, buffer, protocol=2)
+        buffer.write(self._craft_global_reduce_pickle("numpy", "load"))
+
+        result = self._scan_bytes(buffer.getvalue())
+        assert any(
+            check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and "numpy.load" in check.message
+            for check in result.checks
+        ), f"Expected numpy.load detection in second stream, checks: {[c.message for c in result.checks]}"
 
 
 class TestCVE20251716PipMainBlocklist(unittest.TestCase):

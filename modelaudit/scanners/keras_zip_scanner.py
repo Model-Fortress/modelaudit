@@ -25,7 +25,7 @@ from ..config.explanations import (
     get_pattern_explanation,
 )
 from .base import BaseScanner, IssueSeverity, ScanResult
-from .keras_utils import check_subclassed_model
+from .keras_utils import check_lambda_dict_function, check_subclassed_model
 
 # CVE-2025-1550: Keras safe_mode bypass via arbitrary module references in config.json
 # Allowlist of top-level module names that are safe in Keras model configs.
@@ -954,6 +954,11 @@ class KerasZipScanner(BaseScanner):
                             "error": str(e),
                         },
                     )
+        elif isinstance(function_data, dict):
+            # Keras 3.x dict-format Lambda: {"class_name": "__lambda__", "config": {"code": ...}}
+            check_lambda_dict_function(
+                function_data, result, f"{self.current_file_path} (layer: {layer_name})", layer_name
+            )
         else:
             # Lambda layer without encoded function - check other fields
             module_name = layer_config.get("module")

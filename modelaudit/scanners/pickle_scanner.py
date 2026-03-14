@@ -446,6 +446,7 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
     "urllib",
     "urllib2",
     "http",
+    "httplib",
     "ftplib",
     "telnetlib",
     "pty",
@@ -3805,26 +3806,54 @@ class PickleScanner(BaseScanner):
     ) -> set[tuple[str, str] | tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
         globals_found: set[tuple[str, str] | tuple[str, str, str]] = set()
+        ops: list[tuple[Any, Any, int | None]] = []
+        extracted_opcodes = 0
+
         try:
-            ops: list[tuple[Any, Any, int | None]] = list(
-                _genops_with_fallback(data, multi_stream=multiple_pickles)
-            )
+            op_iter = _genops_with_fallback(data, multi_stream=multiple_pickles)
+            while True:
+                if extracted_opcodes >= self.max_opcodes:
+                    logger.warning(
+                        "Advanced global extraction stopped after reaching max_opcodes=%d",
+                        self.max_opcodes,
+                    )
+                    break
+                if self.scan_start_time is not None and time.time() - self.scan_start_time > self.timeout:
+                    logger.warning(
+                        "Advanced global extraction stopped after reaching timeout=%ss",
+                        self.timeout,
+                    )
+                    break
+                try:
+                    op = next(op_iter)
+                except StopIteration:
+                    break
+                ops.append(op)
+                extracted_opcodes += 1
         except Exception as e:
-            # For internal scanner calls (like joblib), don't fail the entire scan.
-            # Just log the issue and return empty set.
-            logger.debug(f"Pickle parsing failed with no globals found: {e}")
-            return set()
+            if ops:
+                logger.warning(
+                    "Pickle parsing failed during advanced global extraction after %d opcodes; "
+                    "continuing with partial extraction: %s",
+                    extracted_opcodes,
+                    e,
+                )
+            else:
+                # For internal scanner calls (like joblib), don't fail the entire scan.
+                # Just log the issue and return empty set.
+                logger.debug(f"Pickle parsing failed with no globals found: {e}")
+                return set()
 
         stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
 
         for n, (opcode, arg, _pos) in enumerate(ops):
             op_name = opcode.name
             if op_name in {"GLOBAL", "INST"}:
-                parts = str(arg).split(" ", 1)
-                if len(parts) == 2:
-                    globals_found.add((parts[0], parts[1], op_name))
-                elif parts:
-                    globals_found.add((parts[0], "", op_name))
+                parsed = _parse_module_function(str(arg))
+                if parsed:
+                    globals_found.add((parsed[0], parsed[1], op_name))
+                else:
+                    globals_found.add((str(arg), "", op_name))
             elif op_name == "STACK_GLOBAL":
                 resolved = stack_global_refs.get(n)
                 if resolved:

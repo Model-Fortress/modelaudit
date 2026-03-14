@@ -4,6 +4,8 @@ import struct
 import sys
 import tempfile
 import unittest
+from collections.abc import Iterator
+from io import BytesIO
 from pathlib import Path
 from typing import ClassVar
 
@@ -977,6 +979,58 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL smtplib issue, got: {[i.message for i in result.issues]}"
         )
 
+    def test_httplib_import_only_global_blocked(self) -> None:
+        """Python 2 httplib alias GLOBAL imports should match http.client danger handling."""
+        payload = b"\x80\x02chttplib\nHTTPSConnection\n."
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        assert any(
+            check.severity == IssueSeverity.CRITICAL
+            and check.rule_code == "S303"
+            and "httplib.HTTPSConnection" in check.message
+            for check in failed_checks
+        ), f"Expected S303 CRITICAL httplib import finding, got: {[c.message for c in failed_checks]}"
+
+    def test_httplib_reduce_blocked(self) -> None:
+        """Python 2 httplib alias REDUCE payloads should be treated as dangerous."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("httplib", "HTTPSConnection"))
+
+        assert result.success
+        assert result.has_errors
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        assert any(
+            check.severity == IssueSeverity.CRITICAL
+            and check.rule_code == "S201"
+            and "httplib.HTTPSConnection" in check.message
+            for check in failed_checks
+        ), f"Expected S201 CRITICAL httplib reduce finding, got: {[c.message for c in failed_checks]}"
+
+    def test_http_client_coverage_unchanged(self) -> None:
+        """Existing http.client dangerous-global coverage should remain stable."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("http.client", "HTTPSConnection"))
+
+        assert result.success
+        assert result.has_errors
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        assert any(
+            check.severity == IssueSeverity.CRITICAL
+            and check.rule_code == "S201"
+            and "http.client.HTTPSConnection" in check.message
+            for check in failed_checks
+        ), f"Expected CRITICAL http.client reduce finding, got: {[c.message for c in failed_checks]}"
+
+    def test_safe_stdlib_import_remains_non_failing(self) -> None:
+        """Benign stdlib import-only globals should stay non-failing."""
+        payload = b"\x80\x02cdatetime\ndatetime\n."
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert not result.has_errors
+        assert not [check for check in result.checks if check.status == CheckStatus.FAILED]
+
     def test_sqlite3_blocked(self) -> None:
         """sqlite3 module should be flagged as dangerous."""
         result = self._scan_bytes(self._craft_global_reduce_pickle("sqlite3", "connect"))
@@ -1209,6 +1263,113 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         assert details["cwe"] == "CWE-502"
         assert "torch.load" in details["description"]
         assert "2.6.0" in details["remediation"]
+
+    def test_multi_stream_httplib_detected_in_second_stream(self) -> None:
+        """Scanner should detect httplib payload hidden in a second pickle stream."""
+        benign_stream = pickle.dumps({"safe": True}, protocol=2)
+        payload = benign_stream + b"\x80\x02chttplib\nHTTPSConnection\n."
+
+        result = self._scan_bytes(payload)
+
+        assert result.success
+        assert result.has_errors
+        assert any(
+            issue.severity == IssueSeverity.CRITICAL and "httplib" in issue.message.lower() for issue in result.issues
+        ), f"Expected CRITICAL httplib issue in second stream, got: {[i.message for i in result.issues]}"
+
+    def test_zip_entry_with_httplib_payload_is_detected(self) -> None:
+        """Scanner should detect httplib payload embedded in a zip entry."""
+        import zipfile
+
+        from modelaudit.core import scan_file
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zip_path = Path(tmp_dir) / "httplib-payload.zip"
+
+            with zipfile.ZipFile(zip_path, "w") as zf:
+                zf.writestr("nested.pkl", self._craft_global_reduce_pickle("httplib", "HTTPSConnection"))
+
+            result = scan_file(str(zip_path))
+
+            assert result.success
+            assert result.has_errors
+            assert any(
+                issue.severity == IssueSeverity.CRITICAL
+                and "httplib.httpsconnection" in issue.message.lower()
+                and issue.details.get("zip_entry") == "nested.pkl"
+                for issue in result.issues
+            ), f"Expected CRITICAL httplib zip issue, got: {[i.message for i in result.issues]}"
+
+
+def test_extract_globals_advanced_respects_max_opcodes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should stop before consuming opcodes past max_opcodes."""
+    scanner = PickleScanner({"max_opcodes": 3})
+    consumed: list[int] = []
+
+    class _Op:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    def _fake_genops(_data: object, *, multi_stream: bool = False) -> Iterator[tuple[object, object, int]]:
+        del multi_stream
+        for i in range(10):
+            consumed.append(i)
+            yield (_Op("GLOBAL"), f"module_{i} func_{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert consumed == [0, 1, 2]
+    assert globals_found == {
+        ("module_0", "func_0", "GLOBAL"),
+        ("module_1", "func_1", "GLOBAL"),
+        ("module_2", "func_2", "GLOBAL"),
+    }
+
+
+def test_extract_globals_advanced_respects_scan_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should honor an already-expired scan timeout budget."""
+    scanner = PickleScanner({"timeout": 1})
+    scanner.scan_start_time = 100.0
+    consumed: list[int] = []
+
+    class _Op:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    def _fake_genops(_data: object, *, multi_stream: bool = False) -> Iterator[tuple[object, object, int]]:
+        del multi_stream
+        for i in range(10):
+            consumed.append(i)
+            yield (_Op("GLOBAL"), f"module_{i} func_{i}", i)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops)
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner.time.time", lambda: 102.0)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert consumed == []
+    assert globals_found == set()
+
+
+def test_extract_globals_advanced_parses_dot_separated_globals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Advanced extraction should normalize dotted GLOBAL args with the shared parser."""
+    scanner = PickleScanner()
+
+    class _Op:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    def _fake_genops(_data: object, *, multi_stream: bool = False) -> Iterator[tuple[object, object, int]]:
+        del multi_stream
+        yield (_Op("GLOBAL"), "torch.serialization.load", 0)
+
+    monkeypatch.setattr("modelaudit.scanners.pickle_scanner._genops_with_fallback", _fake_genops)
+
+    globals_found = scanner._extract_globals_advanced(data=BytesIO(b"x"), multiple_pickles=False)
+
+    assert globals_found == {("torch.serialization", "load", "GLOBAL")}
 
 
 class TestCVE20251716PipMainBlocklist(unittest.TestCase):

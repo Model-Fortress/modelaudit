@@ -4,7 +4,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar, TypeGuard
+from typing import Any, BinaryIO, ClassVar, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -379,6 +379,7 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "torch.distributed.rpc.RemoteModule",
     # NumPy dangerous functions (Fickling)
     "numpy.testing._private.utils.runstring",
+    "numpy.load",
     # pip as callable (CVE-2025-1716: picklescan bypass via pip.main)
     "pip.main",
     "pip._internal.main",
@@ -418,6 +419,15 @@ ALWAYS_DANGEROUS_FUNCTIONS: set[str] = {
     "ctypes.cast",
     "ctypes.CFUNCTYPE",
     "ctypes.WINFUNCTYPE",
+    # Expanded exact dangerous primitives validated against PickleScan
+    "site.main",
+    "_io.FileIO",
+    "test.support.script_helper.assert_python_ok",
+    "_osx_support._read_output",
+    "_aix_support._read_cmd_output",
+    "_pyrepl.pager.pipe_pager",
+    "torch.serialization.load",
+    "torch._inductor.codecache.compile_file",
 }
 
 # Module prefixes that are always dangerous (Fickling-based + additional)
@@ -3791,52 +3801,32 @@ class PickleScanner(BaseScanner):
             ),
         )
 
-    def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:
+    def _extract_globals_advanced(self, data: BinaryIO, multiple_pickles: bool = True) -> set[tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
-        globals_found: set[tuple[str, str]] = set()
-        memo: dict[int | str, str] = {}
+        globals_found: set[tuple[str, str, str]] = set()
 
-        last_byte = b"dummy"
-        while last_byte != b"":
-            try:
-                ops: list[tuple[Any, Any, int | None]] = list(pickletools.genops(data))
-            except Exception as e:
-                if globals_found:
-                    logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
-                    return globals_found
-                # For internal scanner calls (like joblib), don't fail the entire scan
-                # Just log the issue and return empty set
-                logger.debug(f"Pickle parsing failed with no globals found: {e}")
-                return set()
+        try:
+            ops: list[tuple[Any, Any, int | None]] = list(_genops_with_fallback(data, multi_stream=multiple_pickles))
+        except Exception as e:
+            logger.debug(f"Pickle parsing failed during advanced global extraction: {e}")
+            return set()
 
-            stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
+        stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
 
-            last_byte = data.read(1)
-            if last_byte:
-                data.seek(-1, 1)
+        for n, (opcode, arg, _pos) in enumerate(ops):
+            op_name = opcode.name
+            if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                parsed = _parse_module_function(arg)
+                if parsed is not None:
+                    globals_found.add((*parsed, op_name))
+            elif op_name == "STACK_GLOBAL":
+                resolved = stack_global_refs.get(n)
+                if resolved:
+                    globals_found.add((*resolved, op_name))
+                else:
+                    logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
+                    globals_found.add(("unknown", "unknown", op_name))
 
-            for n, (opcode, arg, _pos) in enumerate(ops):
-                op_name = opcode.name
-                if op_name == "MEMOIZE" and n > 0:
-                    memo[len(memo)] = ops[n - 1][1]
-                elif op_name in {"PUT", "BINPUT", "LONG_BINPUT"} and n > 0:
-                    memo[arg] = ops[n - 1][1]
-                elif op_name in {"GLOBAL", "INST"}:
-                    parts = str(arg).split(" ", 1)
-                    if len(parts) == 2:
-                        globals_found.add((parts[0], parts[1]))
-                    elif parts:
-                        globals_found.add((parts[0], ""))
-                elif op_name == "STACK_GLOBAL":
-                    resolved = stack_global_refs.get(n)
-                    if resolved:
-                        globals_found.add(resolved)
-                    else:
-                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
-                        globals_found.add(("unknown", "unknown"))
-
-            if not multiple_pickles:
-                break
         return globals_found
 
     def _extract_stack_global_values(
@@ -4235,7 +4225,7 @@ class PickleScanner(BaseScanner):
                 result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
 
             # Analyze globals extracted from all pickle streams
-            for mod, func in advanced_globals:
+            for mod, func, opcode_name in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
                     base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
@@ -4246,7 +4236,7 @@ class PickleScanner(BaseScanner):
                     )
                     rule_code = get_import_rule_code(mod, func)
                     if not rule_code:
-                        rule_code = "S205"  # STACK_GLOBAL/GLOBAL fallback
+                        rule_code = get_pickle_opcode_rule_code(opcode_name) or "S206"
                     result.add_check(
                         name="Advanced Global Reference Check",
                         passed=False,
@@ -4257,13 +4247,13 @@ class PickleScanner(BaseScanner):
                         details={
                             "module": mod,
                             "function": func,
-                            "opcode": "STACK_GLOBAL",
+                            "opcode": opcode_name,
                             "ml_context_confidence": ml_context.get(
                                 "overall_confidence",
                                 0,
                             ),
                         },
-                        why=get_import_explanation(mod),
+                        why=get_import_explanation(f"{mod}.{func}"),
                     )
 
             # Record successful ML context validation if content appears safe
@@ -4301,6 +4291,8 @@ class PickleScanner(BaseScanner):
                             )
                             # Get rule code for this import/module
                             rule_code = get_import_rule_code(mod, func)
+                            if not rule_code:
+                                rule_code = "S206"  # GLOBAL fallback
                             result.add_check(
                                 name="Global Module Reference Check",
                                 passed=False,
@@ -4319,7 +4311,7 @@ class PickleScanner(BaseScanner):
                                         0,
                                     ),
                                 },
-                                why=get_import_explanation(mod),
+                                why=get_import_explanation(f"{mod}.{func}"),
                             )
                         else:
                             # Record successful validation of safe global
@@ -4433,40 +4425,61 @@ class PickleScanner(BaseScanner):
                                         ml_context,
                                     )
 
-                                # CVE-2025-32434 is specific to torch.load() and
-                                # should only be referenced for PyTorch file formats
-                                _ext = os.path.splitext(self.current_file_path)[1].lower()
-                                _is_pytorch_file = _ext in {".pt", ".pth"} or (
-                                    _ext == ".bin" and "pytorch" in ml_context.get("frameworks", {})
-                                )
-                                if _is_pytorch_file:
-                                    _reduce_msg = (
-                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
-                                        f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
-                                    )
+                                if is_actually_dangerous:
+                                    _reduce_msg = f"Found REDUCE opcode invoking dangerous global: {associated_global}"
                                     _reduce_details: dict[str, Any] = {
                                         "position": pos,
                                         "opcode": opcode.name,
                                         "associated_global": associated_global,
-                                        "cve_id": "CVE-2025-32434",
                                         "ml_context_confidence": ml_context.get(
                                             "overall_confidence",
                                             0,
                                         ),
                                     }
                                 else:
-                                    _reduce_msg = (
-                                        f"Found REDUCE opcode with non-allowlisted global: {associated_global}"
+                                    # CVE-2025-32434 is specific to torch.load() and
+                                    # should only be referenced for PyTorch file formats
+                                    _ext = os.path.splitext(self.current_file_path)[1].lower()
+                                    _is_pytorch_file = _ext in {".pt", ".pth"} or (
+                                        _ext == ".bin" and "pytorch" in ml_context.get("frameworks", {})
                                     )
-                                    _reduce_details = {
-                                        "position": pos,
-                                        "opcode": opcode.name,
-                                        "associated_global": associated_global,
-                                        "ml_context_confidence": ml_context.get(
-                                            "overall_confidence",
-                                            0,
-                                        ),
-                                    }
+                                    if _is_pytorch_file:
+                                        _reduce_msg = (
+                                            f"Found REDUCE opcode with non-allowlisted global: {associated_global}. "
+                                            f"This may indicate CVE-2025-32434 exploitation (RCE via torch.load)"
+                                        )
+                                        _reduce_details = {
+                                            "position": pos,
+                                            "opcode": opcode.name,
+                                            "associated_global": associated_global,
+                                            "cve_id": "CVE-2025-32434",
+                                            "cvss": 9.8,
+                                            "cwe": "CWE-502",
+                                            "description": (
+                                                "RCE when loading models with torch.load(weights_only=True)"
+                                            ),
+                                            "remediation": (
+                                                "Upgrade to PyTorch 2.6.0 or later, and avoid "
+                                                "torch.load(weights_only=True) with untrusted models."
+                                            ),
+                                            "ml_context_confidence": ml_context.get(
+                                                "overall_confidence",
+                                                0,
+                                            ),
+                                        }
+                                    else:
+                                        _reduce_msg = (
+                                            f"Found REDUCE opcode with non-allowlisted global: {associated_global}"
+                                        )
+                                        _reduce_details = {
+                                            "position": pos,
+                                            "opcode": opcode.name,
+                                            "associated_global": associated_global,
+                                            "ml_context_confidence": ml_context.get(
+                                                "overall_confidence",
+                                                0,
+                                            ),
+                                        }
 
                                 result.add_check(
                                     name="REDUCE Opcode Safety Check",
@@ -4809,7 +4822,7 @@ class PickleScanner(BaseScanner):
                                         0,
                                     ),
                                 },
-                                why=get_import_explanation(mod),
+                                why=get_import_explanation(f"{mod}.{func}"),
                             )
                         else:
                             # Record successful validation of safe STACK_GLOBAL
@@ -4974,7 +4987,7 @@ class PickleScanner(BaseScanner):
             # (e.g. HuggingFace cache stores files as hash blobs without extensions)
             has_joblib_globals = any(
                 mod in {"joblib", "sklearn", "numpy"} or mod.startswith(("joblib.", "sklearn.", "numpy."))
-                for mod, _func in advanced_globals
+                for mod, _func, _opcode in advanced_globals
             )
             is_joblib_content = is_serialization_ext or (not file_ext and has_joblib_globals)
 
@@ -5002,15 +5015,15 @@ class PickleScanner(BaseScanner):
             # legitimate PyTorch structures and no dangerous global references appear.
             global_validation_context = {"is_ml_content": False, "overall_confidence": 0.0, "frameworks": {}}
             has_dangerous_advanced_global = any(
-                _is_actually_dangerous_global(mod, func, global_validation_context) for mod, func in advanced_globals
+                _is_actually_dangerous_global(mod, func, global_validation_context)
+                for mod, func, _opcode in advanced_globals
             )
             has_pytorch_advanced_global = any(
-                mod == "torch" or mod.startswith("torch.") for mod, _func in advanced_globals
+                mod == "torch" or mod.startswith("torch.") for mod, _func, _opcode in advanced_globals
             )
-            has_ordereddict_global = ("collections", "OrderedDict") in advanced_globals or (
-                "torch",
-                "OrderedDict",
-            ) in advanced_globals
+            has_ordereddict_global = any(
+                mod == "collections" and func == "OrderedDict" for mod, func, _opcode in advanced_globals
+            ) or any(mod == "torch" and func == "OrderedDict" for mod, func, _opcode in advanced_globals)
             has_legitimate_pytorch_globals = (
                 bool(advanced_globals)
                 and (has_pytorch_advanced_global or has_ordereddict_global)

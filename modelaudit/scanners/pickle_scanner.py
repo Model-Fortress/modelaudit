@@ -4,7 +4,7 @@ import os
 import pickletools
 import struct
 import time
-from typing import IO, Any, BinaryIO, ClassVar, TypeGuard
+from typing import Any, BinaryIO, ClassVar, TypeGuard
 
 from modelaudit.analysis.enhanced_pattern_detector import EnhancedPatternDetector, PatternMatch
 from modelaudit.analysis.entropy_analyzer import EntropyAnalyzer
@@ -3801,53 +3801,37 @@ class PickleScanner(BaseScanner):
         )
 
     def _extract_globals_advanced(
-        self, data: IO[bytes], multiple_pickles: bool = True
+        self, data: BinaryIO, multiple_pickles: bool = True
     ) -> set[tuple[str, str] | tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
         globals_found: set[tuple[str, str] | tuple[str, str, str]] = set()
-        memo: dict[int | str, str] = {}
+        try:
+            ops: list[tuple[Any, Any, int | None]] = list(
+                _genops_with_fallback(data, multi_stream=multiple_pickles)
+            )
+        except Exception as e:
+            # For internal scanner calls (like joblib), don't fail the entire scan.
+            # Just log the issue and return empty set.
+            logger.debug(f"Pickle parsing failed with no globals found: {e}")
+            return set()
 
-        last_byte = b"dummy"
-        while last_byte != b"":
-            try:
-                ops: list[tuple[Any, Any, int | None]] = list(pickletools.genops(data))
-            except Exception as e:
-                if globals_found:
-                    logger.warning(f"Pickle parsing failed, but found {len(globals_found)} globals: {e}")
-                    return globals_found
-                # For internal scanner calls (like joblib), don't fail the entire scan
-                # Just log the issue and return empty set
-                logger.debug(f"Pickle parsing failed with no globals found: {e}")
-                return set()
+        stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
 
-            stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
-
-            last_byte = data.read(1)
-            if last_byte:
-                data.seek(-1, 1)
-
-            for n, (opcode, arg, _pos) in enumerate(ops):
-                op_name = opcode.name
-                if op_name == "MEMOIZE" and n > 0:
-                    memo[len(memo)] = ops[n - 1][1]
-                elif op_name in {"PUT", "BINPUT", "LONG_BINPUT"} and n > 0:
-                    memo[arg] = ops[n - 1][1]
-                elif op_name in {"GLOBAL", "INST"}:
-                    parts = str(arg).split(" ", 1)
-                    if len(parts) == 2:
-                        globals_found.add((parts[0], parts[1], op_name))
-                    elif parts:
-                        globals_found.add((parts[0], "", op_name))
-                elif op_name == "STACK_GLOBAL":
-                    resolved = stack_global_refs.get(n)
-                    if resolved:
-                        globals_found.add((resolved[0], resolved[1], op_name))
-                    else:
-                        logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
-                        globals_found.add(("unknown", "unknown", op_name))
-
-            if not multiple_pickles:
-                break
+        for n, (opcode, arg, _pos) in enumerate(ops):
+            op_name = opcode.name
+            if op_name in {"GLOBAL", "INST"}:
+                parts = str(arg).split(" ", 1)
+                if len(parts) == 2:
+                    globals_found.add((parts[0], parts[1], op_name))
+                elif parts:
+                    globals_found.add((parts[0], "", op_name))
+            elif op_name == "STACK_GLOBAL":
+                resolved = stack_global_refs.get(n)
+                if resolved:
+                    globals_found.add((resolved[0], resolved[1], op_name))
+                else:
+                    logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
+                    globals_found.add(("unknown", "unknown", op_name))
         return globals_found
 
     def _extract_stack_global_values(

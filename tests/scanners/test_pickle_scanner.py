@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -628,7 +629,7 @@ class TestPickleScannerAdvanced(unittest.TestCase):
 class TestPickleScannerBlocklistHardening(unittest.TestCase):
     """Regression tests for fickling/picklescan bypass hardening."""
 
-    PICKLESCAN_GAP_REFS = (
+    PICKLESCAN_GAP_REFS: ClassVar[tuple[tuple[str, str], ...]] = (
         ("numpy", "load"),
         ("site", "main"),
         ("_io", "FileIO"),
@@ -662,6 +663,13 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
         """Craft a minimal pickle with a bare GLOBAL reference and STOP."""
 
         return b"\x80\x02" + b"c" + f"{module}\n{func}\n".encode() + b"."
+
+    @staticmethod
+    def _prepend_comment_token(payload: bytes, comment: bytes = b"# harmless note") -> bytes:
+        """Prefix a benign comment-like token without changing the malicious stream."""
+        comment_op = b"\x8c" + bytes([len(comment)]) + comment
+        pop_op = b"0"
+        return b"\x80\x02" + comment_op + pop_op + payload[2:]
 
     def _scan_bytes(self, data: bytes, *, suffix: str = ".pkl") -> ScanResult:
         import os
@@ -1052,6 +1060,42 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
                 if check.name == "REDUCE Opcode Safety Check"
             ), f"Dangerous global should not degrade to a generic warning for {module}.{func}"
 
+    def test_comment_token_does_not_bypass_picklescan_gap_import_only_detection(self) -> None:
+        """A single comment-like token must not suppress import-only dangerous global findings."""
+        payload = self._prepend_comment_token(self._craft_global_only_pickle("numpy", "load"))
+        result = self._scan_bytes(payload)
+
+        assert any(
+            check.name == "Advanced Global Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.rule_code == "S206"
+            and check.details.get("opcode") == "GLOBAL"
+            and "numpy.load" in check.message
+            for check in result.checks
+        ), f"Expected advanced GLOBAL detection despite comment token, checks: {[c.message for c in result.checks]}"
+        assert any(
+            check.name == "Global Module Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.rule_code == "S206"
+            and "numpy.load" in check.message
+            for check in result.checks
+        ), f"Expected GLOBAL detection despite comment token, checks: {[c.message for c in result.checks]}"
+
+    def test_comment_token_does_not_bypass_picklescan_gap_reduce_detection(self) -> None:
+        """A single comment-like token must not suppress dangerous REDUCE flows."""
+        payload = self._prepend_comment_token(self._craft_global_reduce_pickle("numpy", "load"))
+        result = self._scan_bytes(payload)
+
+        assert any(
+            check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and "numpy.load" in check.message
+            for check in result.checks
+        ), f"Expected REDUCE detection despite comment token, checks: {[c.message for c in result.checks]}"
+
     def test_picklescan_gap_imports_use_exact_why_explanations(self) -> None:
         """Exact dotted-name explanations should be used for new dangerous refs."""
         result = self._scan_bytes(self._craft_global_only_pickle("numpy", "load"))
@@ -1067,11 +1111,11 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             result = self._scan_bytes(self._craft_global_only_pickle(module, func))
             assert result.success
             assert not any(
-                check.name == "Global Module Reference Check"
+                check.name in {"Global Module Reference Check", "Advanced Global Reference Check"}
                 and check.status == CheckStatus.FAILED
                 and f"{module}.{func}" in check.message
                 for check in result.checks
-            ), f"Unexpected failing global check for safe reference {module}.{func}"
+            ), f"Unexpected failing dotted-reference check for safe reference {module}.{func}"
 
     def test_existing_reference_behavior_unchanged(self) -> None:
         """Existing dangerous references should remain failing after the expansion."""
@@ -1082,7 +1126,13 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             ("venv", "create"),
         ]:
             result = self._scan_bytes(self._craft_global_reduce_pickle(module, func))
-            assert result.has_errors, f"Expected existing dangerous behavior for {module}.{func}"
+            assert any(
+                check.status == CheckStatus.FAILED
+                and check.name
+                in {"REDUCE Opcode Safety Check", "Global Module Reference Check", "Advanced Global Reference Check"}
+                and f"{module}.{func}" in check.message
+                for check in result.checks
+            ), f"Expected exact failing check for {module}.{func}, checks: {[c.message for c in result.checks]}"
 
     def test_picklescan_gap_detected_inside_zip_entry(self) -> None:
         """Dangerous primitive inside a ZIP entry should be detected by archive scanning."""
@@ -1121,6 +1171,26 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             and "numpy.load" in check.message
             for check in result.checks
         ), f"Expected numpy.load detection in second stream, checks: {[c.message for c in result.checks]}"
+
+    def test_picklescan_gap_advanced_globals_resync_after_separator(self) -> None:
+        """Advanced global extraction should resync past separator bytes before a later pickle stream."""
+        import io
+
+        buffer = io.BytesIO()
+        pickle.dump({"safe": True}, buffer, protocol=2)
+        buffer.write(b"\xff")
+        buffer.write(self._craft_global_only_pickle("numpy", "load"))
+
+        result = self._scan_bytes(buffer.getvalue())
+        assert any(
+            check.name == "Advanced Global Reference Check"
+            and check.status == CheckStatus.FAILED
+            and check.severity == IssueSeverity.CRITICAL
+            and check.rule_code == "S206"
+            and check.details.get("opcode") == "GLOBAL"
+            and "numpy.load" in check.message
+            for check in result.checks
+        ), f"Expected advanced GLOBAL detection after separator resync, checks: {[c.message for c in result.checks]}"
 
     def test_pytorch_reduce_cve_metadata_is_complete(self) -> None:
         """PyTorch-file REDUCE hints should include complete CVE metadata fields."""

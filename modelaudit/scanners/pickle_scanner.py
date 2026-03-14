@@ -826,7 +826,8 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
     ],
     # Python builtins - safe built-in types and functions
     # NOTE: eval, exec, compile, __import__, open, file are NOT in this list (they remain dangerous)
-    # NOTE: getattr, setattr, delattr are also NOT in this list (in ALWAYS_DANGEROUS_FUNCTIONS)
+    # NOTE: getattr, setattr, delattr, hasattr are NOT in this list
+    # because attribute-access primitives must never be allowlisted.
     "__builtin__": [  # Python 2 builtins
         "set",
         "frozenset",
@@ -861,7 +862,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "id",
         "isinstance",
         "issubclass",
-        "hasattr",
         "callable",
         "repr",
         "ascii",
@@ -921,7 +921,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "id",
         "isinstance",
         "issubclass",
-        "hasattr",
         "callable",
         "repr",
         "ascii",

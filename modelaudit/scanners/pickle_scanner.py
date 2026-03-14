@@ -3800,9 +3800,11 @@ class PickleScanner(BaseScanner):
             ),
         )
 
-    def _extract_globals_advanced(self, data: IO[bytes], multiple_pickles: bool = True) -> set[tuple[str, str]]:
+    def _extract_globals_advanced(
+        self, data: IO[bytes], multiple_pickles: bool = True
+    ) -> set[tuple[str, str] | tuple[str, str, str]]:
         """Advanced pickle global extraction with STACK_GLOBAL and memo support."""
-        globals_found: set[tuple[str, str]] = set()
+        globals_found: set[tuple[str, str] | tuple[str, str, str]] = set()
         memo: dict[int | str, str] = {}
 
         last_byte = b"dummy"
@@ -3833,16 +3835,16 @@ class PickleScanner(BaseScanner):
                 elif op_name in {"GLOBAL", "INST"}:
                     parts = str(arg).split(" ", 1)
                     if len(parts) == 2:
-                        globals_found.add((parts[0], parts[1]))
+                        globals_found.add((parts[0], parts[1], op_name))
                     elif parts:
-                        globals_found.add((parts[0], ""))
+                        globals_found.add((parts[0], "", op_name))
                 elif op_name == "STACK_GLOBAL":
                     resolved = stack_global_refs.get(n)
                     if resolved:
-                        globals_found.add(resolved)
+                        globals_found.add((resolved[0], resolved[1], op_name))
                     else:
                         logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
-                        globals_found.add(("unknown", "unknown"))
+                        globals_found.add(("unknown", "unknown", op_name))
 
             if not multiple_pickles:
                 break
@@ -3891,7 +3893,16 @@ class PickleScanner(BaseScanner):
 
         file_obj.seek(current_pos)  # Reset position
         # Extract global references across all pickle streams
-        advanced_globals = self._extract_globals_advanced(file_obj)
+        raw_advanced_globals = self._extract_globals_advanced(file_obj)
+        advanced_globals: set[tuple[str, str, str]] = set()
+        for entry in raw_advanced_globals:
+            if len(entry) == 3:
+                mod, func, opcode_name = entry
+            else:
+                mod, func = entry
+                opcode_name = "GLOBAL"
+            advanced_globals.add((mod, func, opcode_name))
+        advanced_global_pairs = {(mod, func) for mod, func, _opcode in advanced_globals}
         file_obj.seek(current_pos)  # Reset again after extraction
 
         # CRITICAL FIX: Scan for dangerous patterns in embedded pickles
@@ -4244,7 +4255,7 @@ class PickleScanner(BaseScanner):
                 result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
 
             # Analyze globals extracted from all pickle streams
-            for mod, func in advanced_globals:
+            for mod, func, advanced_opcode in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
                     base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
@@ -4255,7 +4266,7 @@ class PickleScanner(BaseScanner):
                     )
                     rule_code = get_import_rule_code(mod, func)
                     if not rule_code:
-                        rule_code = "S205"  # STACK_GLOBAL/GLOBAL fallback
+                        rule_code = get_pickle_opcode_rule_code(advanced_opcode) or "S206"
                     result.add_check(
                         name="Advanced Global Reference Check",
                         passed=False,
@@ -4266,7 +4277,7 @@ class PickleScanner(BaseScanner):
                         details={
                             "module": mod,
                             "function": func,
-                            "opcode": "STACK_GLOBAL",
+                            "opcode": advanced_opcode,
                             "ml_context_confidence": ml_context.get(
                                 "overall_confidence",
                                 0,
@@ -4472,6 +4483,13 @@ class PickleScanner(BaseScanner):
                                             "opcode": opcode.name,
                                             "associated_global": associated_global,
                                             "cve_id": "CVE-2025-32434",
+                                            "cvss": 9.8,
+                                            "cwe": "CWE-502",
+                                            "description": "RCE when loading models with torch.load(weights_only=True)",
+                                            "remediation": (
+                                                "Upgrade to PyTorch 2.6.0 or later and avoid loading untrusted "
+                                                "pickles even with weights_only=True."
+                                            ),
                                             "ml_context_confidence": ml_context.get(
                                                 "overall_confidence",
                                                 0,
@@ -4997,7 +5015,7 @@ class PickleScanner(BaseScanner):
             # (e.g. HuggingFace cache stores files as hash blobs without extensions)
             has_joblib_globals = any(
                 mod in {"joblib", "sklearn", "numpy"} or mod.startswith(("joblib.", "sklearn.", "numpy."))
-                for mod, _func in advanced_globals
+                for mod, _func, _opcode in advanced_globals
             )
             is_joblib_content = is_serialization_ext or (not file_ext and has_joblib_globals)
 
@@ -5025,15 +5043,16 @@ class PickleScanner(BaseScanner):
             # legitimate PyTorch structures and no dangerous global references appear.
             global_validation_context = {"is_ml_content": False, "overall_confidence": 0.0, "frameworks": {}}
             has_dangerous_advanced_global = any(
-                _is_actually_dangerous_global(mod, func, global_validation_context) for mod, func in advanced_globals
+                _is_actually_dangerous_global(mod, func, global_validation_context)
+                for mod, func, _opcode in advanced_globals
             )
             has_pytorch_advanced_global = any(
-                mod == "torch" or mod.startswith("torch.") for mod, _func in advanced_globals
+                mod == "torch" or mod.startswith("torch.") for mod, _func, _opcode in advanced_globals
             )
-            has_ordereddict_global = ("collections", "OrderedDict") in advanced_globals or (
+            has_ordereddict_global = ("collections", "OrderedDict") in advanced_global_pairs or (
                 "torch",
                 "OrderedDict",
-            ) in advanced_globals
+            ) in advanced_global_pairs
             has_legitimate_pytorch_globals = (
                 bool(advanced_globals)
                 and (has_pytorch_advanced_global or has_ordereddict_global)

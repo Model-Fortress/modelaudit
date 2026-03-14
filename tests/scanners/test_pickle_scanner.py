@@ -663,11 +663,11 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
 
         return b"\x80\x02" + b"c" + f"{module}\n{func}\n".encode() + b"."
 
-    def _scan_bytes(self, data: bytes) -> ScanResult:
+    def _scan_bytes(self, data: bytes, *, suffix: str = ".pkl") -> ScanResult:
         import os
         import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(data)
             f.flush()
             path = f.name
@@ -1017,6 +1017,15 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             result = self._scan_bytes(self._craft_global_only_pickle(module, func))
             assert result.has_errors, f"Expected failing checks for {module}.{func}"
             assert any(
+                check.name == "Advanced Global Reference Check"
+                and check.status == CheckStatus.FAILED
+                and check.severity == IssueSeverity.CRITICAL
+                and check.rule_code == "S206"
+                and check.details.get("opcode") == "GLOBAL"
+                and f"{module}.{func}" in check.message
+                for check in result.checks
+            ), f"Expected advanced GLOBAL fallback for {module}.{func}, checks: {[c.message for c in result.checks]}"
+            assert any(
                 check.name == "Global Module Reference Check"
                 and check.status == CheckStatus.FAILED
                 and check.severity == IssueSeverity.CRITICAL
@@ -1112,6 +1121,24 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             and "numpy.load" in check.message
             for check in result.checks
         ), f"Expected numpy.load detection in second stream, checks: {[c.message for c in result.checks]}"
+
+    def test_pytorch_reduce_cve_metadata_is_complete(self) -> None:
+        """PyTorch-file REDUCE hints should include complete CVE metadata fields."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("fractions", "Fraction"), suffix=".pt")
+        reduce_checks = [
+            check
+            for check in result.checks
+            if check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("cve_id") == "CVE-2025-32434"
+        ]
+
+        assert reduce_checks, f"Expected CVE-attributed REDUCE check, got: {[c.details for c in result.checks]}"
+        details = reduce_checks[0].details
+        assert details["cvss"] == 9.8
+        assert details["cwe"] == "CWE-502"
+        assert "torch.load" in details["description"]
+        assert "2.6.0" in details["remediation"]
 
 
 class TestCVE20251716PipMainBlocklist(unittest.TestCase):

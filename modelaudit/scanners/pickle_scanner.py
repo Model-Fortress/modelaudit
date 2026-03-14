@@ -1,5 +1,6 @@
 """Scanner for Python pickle serialized files (.pkl, .pickle)."""
 
+import io
 import os
 import pickletools
 import struct
@@ -44,6 +45,105 @@ from .rule_mapper import (
 _RESYNC_BUDGET = 8192  # Max bytes to scan forward when resyncing after an unknown opcode
 COPYREG_EXTENSION_MODULE = "__copyreg_extension__"
 COPYREG_EXTENSION_PREFIX = "code_"
+
+
+def _scan_structural_tamper_findings(file_data: bytes) -> list[dict[str, Any]]:
+    """Detect structurally suspicious pickle stream patterns.
+
+    This scanner intentionally focuses on true pickle-structure violations and keeps
+    severity low so malformed/truncated payloads are visible without overshadowing
+    direct code-execution signals.
+    """
+
+    findings: list[dict[str, Any]] = []
+    if not file_data:
+        return findings
+
+    offset = 0
+    max_separator_skip = 256
+
+    while offset < len(file_data):
+        stream = file_data[offset:]
+        bio = io.BytesIO(stream)
+        stream_opcode_count = 0
+        stream_had_stop = False
+        seen_proto_version: int | None = None
+
+        try:
+            for opcode, arg, pos in pickletools.genops(bio):
+                stream_opcode_count += 1
+                opcode_pos = int(pos) if pos is not None else 0
+                absolute_pos = offset + opcode_pos
+
+                if opcode.name == "PROTO":
+                    if stream_opcode_count > 1:
+                        findings.append(
+                            {
+                                "kind": "misplaced_proto",
+                                "stream_offset": offset,
+                                "position": absolute_pos,
+                                "protocol": arg,
+                            }
+                        )
+
+                    if seen_proto_version is not None:
+                        findings.append(
+                            {
+                                "kind": "duplicate_proto",
+                                "stream_offset": offset,
+                                "position": absolute_pos,
+                                "protocol": arg,
+                                "previous_protocol": seen_proto_version,
+                            }
+                        )
+                    seen_proto_version = int(arg) if isinstance(arg, int) else None
+
+                if opcode.name == "STOP":
+                    stream_had_stop = True
+                    offset = absolute_pos + 1
+                    break
+        except ValueError:
+            # Do not emit standalone invalid-opcode findings here. Legitimate
+            # pickle-adjacent formats can contain binary tails or protocol/
+            # opcode mismatches that trigger parser errors after a valid
+            # prefix, and surfacing those as tamper findings is too noisy.
+            # Instead, resync to the next likely binary pickle stream and
+            # continue looking for true structural violations.
+            probe_start = min(offset + 1, len(file_data))
+            probe_end = min(offset + _RESYNC_BUDGET, len(file_data))
+            next_offset = -1
+            for idx in range(probe_start, probe_end - 1):
+                if file_data[idx] == 0x80 and file_data[idx + 1] in (2, 3, 4, 5):
+                    next_offset = idx
+                    break
+
+            if next_offset >= 0:
+                offset = next_offset
+                continue
+
+            # If there is no next stream candidate, treat remaining bytes as non-pickle tail.
+            break
+        except Exception:
+            # Structural tamper detection is opportunistic and must not change
+            # the scanner's existing error-handling behavior for parse limits
+            # or framework-specific edge cases.
+            break
+
+        if stream_had_stop:
+            skipped = 0
+            while offset < len(file_data) and skipped < max_separator_skip:
+                if file_data[offset] == 0x80 and offset + 1 < len(file_data) and file_data[offset + 1] in (2, 3, 4, 5):
+                    break
+                offset += 1
+                skipped += 1
+            if skipped >= max_separator_skip and offset < len(file_data):
+                break
+            continue
+
+        # No STOP and no exception means empty parse; advance to avoid infinite loop.
+        offset += 1
+
+    return findings
 
 
 def _genops_with_fallback(file_obj: BinaryIO, *, multi_stream: bool = False) -> Any:
@@ -3839,25 +3939,21 @@ class PickleScanner(BaseScanner):
                     e,
                 )
             else:
-                # For internal scanner calls (like joblib), don't fail the entire scan.
-                # Just log the issue and return empty set.
-                logger.debug(f"Pickle parsing failed with no globals found: {e}")
+                logger.debug(f"Pickle parsing failed during advanced global extraction: {e}")
                 return set()
 
         stack_global_refs, _callable_refs = _build_symbolic_reference_maps(ops)
 
         for n, (opcode, arg, _pos) in enumerate(ops):
             op_name = opcode.name
-            if op_name in {"GLOBAL", "INST"}:
-                parsed = _parse_module_function(str(arg))
-                if parsed:
-                    globals_found.add((parsed[0], parsed[1], op_name))
-                else:
-                    globals_found.add((str(arg), "", op_name))
+            if op_name in {"GLOBAL", "INST"} and isinstance(arg, str):
+                parsed = _parse_module_function(arg)
+                if parsed is not None:
+                    globals_found.add((*parsed, op_name))
             elif op_name == "STACK_GLOBAL":
                 resolved = stack_global_refs.get(n)
                 if resolved:
-                    globals_found.add((resolved[0], resolved[1], op_name))
+                    globals_found.add((*resolved, op_name))
                 else:
                     logger.debug(f"STACK_GLOBAL parsing failed at position {n}")
                     globals_found.add(("unknown", "unknown", op_name))
@@ -3959,6 +4055,55 @@ class PickleScanner(BaseScanner):
         else:
             result.metadata.setdefault("disabled_checks", []).append("Network Communication Detection")
 
+        structural_findings = _scan_structural_tamper_findings(file_data)
+        for finding in structural_findings:
+            kind = finding["kind"]
+            position = finding.get("position")
+            stream_offset = finding.get("stream_offset")
+            if kind == "duplicate_proto":
+                prev_protocol = finding.get("previous_protocol")
+                protocol = finding.get("protocol")
+                result.add_check(
+                    name="Pickle Structural Tamper Check",
+                    passed=False,
+                    message=(
+                        "Duplicate PROTO opcode in pickle stream "
+                        f"at byte position {position} (previous={prev_protocol}, current={protocol})"
+                    ),
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (pos {position})",
+                    details={
+                        "tamper_type": kind,
+                        "position": position,
+                        "stream_offset": stream_offset,
+                        "protocol": protocol,
+                        "previous_protocol": prev_protocol,
+                    },
+                    why=(
+                        "Multiple protocol declarations inside one pickle stream are structurally unusual and can be "
+                        "used to probe parser differences between tools."
+                    ),
+                    rule_code="S902",
+                )
+            elif kind == "misplaced_proto":
+                result.add_check(
+                    name="Pickle Structural Tamper Check",
+                    passed=False,
+                    message=f"Misplaced PROTO opcode in pickle stream at byte position {position}",
+                    severity=IssueSeverity.INFO,
+                    location=f"{self.current_file_path} (pos {position})",
+                    details={
+                        "tamper_type": kind,
+                        "position": position,
+                        "stream_offset": stream_offset,
+                        "protocol": finding.get("protocol"),
+                    },
+                    why=(
+                        "Binary protocol declarations are expected at the beginning of a stream. A later PROTO opcode "
+                        "indicates structural tampering or malformed serialization."
+                    ),
+                    rule_code="S902",
+                )
         # Check pickle protocol version
         if file_data and len(file_data) >= 2:
             if file_data[0] == 0x80:  # Protocol 2+
@@ -4268,7 +4413,7 @@ class PickleScanner(BaseScanner):
                 result.metadata["first_pickle_end_pos"] = first_pickle_end_pos
 
             # Analyze globals extracted from all pickle streams
-            for mod, func, advanced_opcode in advanced_globals:
+            for mod, func, opcode_name in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
                     base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
@@ -4279,7 +4424,7 @@ class PickleScanner(BaseScanner):
                     )
                     rule_code = get_import_rule_code(mod, func)
                     if not rule_code:
-                        rule_code = get_pickle_opcode_rule_code(advanced_opcode) or "S206"
+                        rule_code = get_pickle_opcode_rule_code(opcode_name) or "S206"
                     result.add_check(
                         name="Advanced Global Reference Check",
                         passed=False,
@@ -4290,7 +4435,7 @@ class PickleScanner(BaseScanner):
                         details={
                             "module": mod,
                             "function": func,
-                            "opcode": advanced_opcode,
+                            "opcode": opcode_name,
                             "ml_context_confidence": ml_context.get(
                                 "overall_confidence",
                                 0,
@@ -4498,10 +4643,12 @@ class PickleScanner(BaseScanner):
                                             "cve_id": "CVE-2025-32434",
                                             "cvss": 9.8,
                                             "cwe": "CWE-502",
-                                            "description": "RCE when loading models with torch.load(weights_only=True)",
+                                            "description": (
+                                                "RCE when loading models with torch.load(weights_only=True)"
+                                            ),
                                             "remediation": (
-                                                "Upgrade to PyTorch 2.6.0 or later and avoid loading untrusted "
-                                                "pickles even with weights_only=True."
+                                                "Upgrade to PyTorch 2.6.0 or later, and avoid "
+                                                "torch.load(weights_only=True) with untrusted models."
                                             ),
                                             "ml_context_confidence": ml_context.get(
                                                 "overall_confidence",

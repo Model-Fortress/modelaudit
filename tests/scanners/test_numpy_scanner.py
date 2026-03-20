@@ -5,6 +5,7 @@ from typing import Any
 
 import numpy as np
 
+from modelaudit.core import determine_exit_code, scan_model_directory_or_file
 from modelaudit.scanners.base import Check, IssueSeverity, ScanResult
 from modelaudit.scanners.numpy_scanner import NumPyScanner
 
@@ -39,7 +40,7 @@ class TestCVE20196446ObjectDtype:
     """Tests for CVE-2019-6446: NumPy allow_pickle RCE via object dtype."""
 
     def test_object_dtype_triggers_cve(self, tmp_path):
-        """Object dtype array should trigger CVE-2019-6446 warning-level potential-RCE check."""
+        """Object dtype array should trigger informational CVE-2019-6446 attribution."""
         arr = np.array(["hello", "world"], dtype=object)
         path = tmp_path / "object_array.npy"
         np.save(path, arr, allow_pickle=True)
@@ -50,10 +51,13 @@ class TestCVE20196446ObjectDtype:
         assert result.success is True
         cve_checks = [c for c in result.checks if "CVE-2019-6446" in c.name or "CVE-2019-6446" in c.message]
         assert len(cve_checks) > 0, f"Should detect CVE-2019-6446. Checks: {[c.message for c in result.checks]}"
-        assert cve_checks[0].severity == IssueSeverity.WARNING
+        assert cve_checks[0].severity == IssueSeverity.INFO
         assert cve_checks[0].details.get("cve_id") == "CVE-2019-6446"
         assert not any(c.name == "Data Type Safety Check" and c.status.value == "failed" for c in result.checks), (
             f"Object dtype should not be treated as a scan failure: {[c.message for c in result.checks]}"
+        )
+        assert not any(issue.severity == IssueSeverity.WARNING for issue in result.issues), (
+            f"Benign object-dtype payloads should not emit warnings: {[i.message for i in result.issues]}"
         )
 
     def test_numeric_dtype_no_cve(self, tmp_path):
@@ -272,6 +276,29 @@ def test_benign_object_dtype_numpy_no_nested_critical(tmp_path: Path) -> None:
     assert result.has_errors is False
     assert any("CVE-2019-6446" in (c.name + c.message) for c in result.checks)
     assert not any(i.severity == IssueSeverity.CRITICAL for i in result.issues if "CVE-2019-6446" not in i.message)
+
+
+def test_numpy_object_dtype_benign_exit0(tmp_path: Path) -> None:
+    arr = np.array([{"k": "v"}, [1, 2, 3]], dtype=object)
+    path = tmp_path / "benign_object.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(str(path))
+
+    assert determine_exit_code(result) == 0
+    assert not any(issue.severity == IssueSeverity.WARNING for issue in result.issues)
+    assert not any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
+
+
+def test_numpy_object_dtype_malicious_exit1(tmp_path: Path) -> None:
+    arr = np.array([_ExecPayload()], dtype=object)
+    path = tmp_path / "malicious_object.npy"
+    np.save(path, arr, allow_pickle=True)
+
+    result = scan_model_directory_or_file(str(path))
+
+    assert determine_exit_code(result) == 1
+    assert any(issue.severity == IssueSeverity.CRITICAL for issue in result.issues)
 
 
 def test_benign_object_dtype_npz_no_nested_critical(tmp_path: Path) -> None:

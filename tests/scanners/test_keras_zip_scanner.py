@@ -820,6 +820,68 @@ __import__('pickle').loads(data)
         assert all(check.name != "Custom Layer Class Detection" for check in result.checks)
         assert all(check.name != "Custom Object Detection" for check in result.checks)
 
+    def test_builtin_registered_name_with_non_allowlisted_module_is_flagged(self, tmp_path: Path) -> None:
+        """Spoofed built-in registered names must not hide custom modules."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "InputLayer",
+                        "name": "input_1",
+                        "config": {"batch_shape": [None, 4]},
+                    },
+                    {
+                        "class_name": "Add",
+                        "name": "spoofed_add",
+                        "module": "evil.module",
+                        "registered_name": "Add",
+                        "config": {},
+                    },
+                ]
+            },
+        }
+
+        result = scanner.scan(
+            str(create_configured_keras_zip(tmp_path, config, file_name="spoofed_builtin_registered.keras"))
+        )
+
+        custom_object_checks = [check for check in result.checks if check.name == "Custom Object Detection"]
+        assert len(custom_object_checks) == 1
+        assert custom_object_checks[0].details["registered_name"] == "Add"
+
+    def test_builtin_registered_name_with_mixed_module_refs_is_flagged(self, tmp_path: Path) -> None:
+        """A safe module reference must not suppress a separate unsafe one."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "InputLayer",
+                        "name": "input_1",
+                        "config": {"batch_shape": [None, 4]},
+                    },
+                    {
+                        "class_name": "Add",
+                        "name": "spoofed_add",
+                        "module": "keras.src.ops.numpy",
+                        "registered_name": "Add",
+                        "config": {"fn_module": "evil.module"},
+                    },
+                ]
+            },
+        }
+
+        result = scanner.scan(
+            str(create_configured_keras_zip(tmp_path, config, file_name="mixed_builtin_registered.keras"))
+        )
+
+        custom_object_checks = [check for check in result.checks if check.name == "Custom Object Detection"]
+        assert len(custom_object_checks) == 1
+        assert custom_object_checks[0].details["registered_name"] == "Add"
+
     def test_allowlisted_module_layer_does_not_false_positive(self, tmp_path: Path) -> None:
         """Layers from allowlisted Keras modules should not be treated as custom objects."""
         scanner = KerasZipScanner()

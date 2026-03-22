@@ -118,17 +118,29 @@ class KerasZipScanner(BaseScanner):
             return False
         return module_value.strip().split(".")[0] in _SAFE_KERAS_MODULE_ROOTS
 
-    def _layer_uses_allowlisted_module(self, layer: dict[str, Any]) -> bool:
+    def _iter_layer_module_references(self, layer: dict[str, Any]) -> list[str]:
         layer_config = layer.get("config", {})
         if not isinstance(layer_config, dict):
             layer_config = {}
 
+        module_references: list[str] = []
         for key in ("module", "fn_module"):
-            if self._is_allowlisted_keras_module(layer.get(key)):
-                return True
-            if self._is_allowlisted_keras_module(layer_config.get(key)):
-                return True
-        return False
+            for value in (layer.get(key), layer_config.get(key)):
+                if isinstance(value, str) and value.strip():
+                    module_references.append(value.strip())
+        return module_references
+
+    def _layer_uses_allowlisted_module(self, layer: dict[str, Any]) -> bool:
+        return any(
+            self._is_allowlisted_keras_module(module_value)
+            for module_value in self._iter_layer_module_references(layer)
+        )
+
+    def _layer_uses_non_allowlisted_module(self, layer: dict[str, Any]) -> bool:
+        return any(
+            not self._is_allowlisted_keras_module(module_value)
+            for module_value in self._iter_layer_module_references(layer)
+        )
 
     @staticmethod
     def _is_known_safe_allowlisted_registered_object(identifier: Any) -> bool:
@@ -148,17 +160,19 @@ class KerasZipScanner(BaseScanner):
         if not isinstance(registered_name, str) or not registered_name.strip():
             return False
 
-        if is_known_safe_keras_layer_class(registered_name):
-            return False
-
+        normalized_registered_name = registered_name.strip()
+        has_allowlisted_module = self._layer_uses_allowlisted_module(layer)
+        has_non_allowlisted_module = self._layer_uses_non_allowlisted_module(layer)
         layer_class = layer.get("class_name")
-        if isinstance(layer_class, str) and registered_name.strip() == layer_class.strip():
+        if isinstance(layer_class, str) and normalized_registered_name == layer_class.strip():
             if self._is_known_safe_serialized_layer(layer):
-                return False
-            return not (
-                self._layer_uses_allowlisted_module(layer)
-                and self._is_known_safe_allowlisted_registered_object(layer_class)
+                return has_non_allowlisted_module
+            return has_non_allowlisted_module or not (
+                has_allowlisted_module and self._is_known_safe_allowlisted_registered_object(layer_class)
             )
+
+        if is_known_safe_keras_layer_class(normalized_registered_name):
+            return has_non_allowlisted_module
 
         return True
 

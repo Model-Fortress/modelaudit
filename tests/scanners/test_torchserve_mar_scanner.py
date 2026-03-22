@@ -11,6 +11,7 @@ from typing import Any
 from modelaudit import core
 from modelaudit.scanners.base import CheckStatus, IssueSeverity, ScanResult
 from modelaudit.scanners.torchserve_mar_scanner import TorchServeMarScanner
+from modelaudit.scanners.zip_scanner import ZipScanner
 
 
 def _create_mar_archive(
@@ -401,3 +402,20 @@ def test_scan_detects_suspicious_compression_ratio_in_valid_mar(tmp_path: Path) 
     ratio_failures = _failed_checks(result, "TorchServe MAR Compression Ratio Check")
     assert len(ratio_failures) >= 1
     assert any(check.details.get("entry") == "weights.bin" for check in ratio_failures)
+
+
+def test_core_mar_fallback_bounds_python_handler_analysis_size(tmp_path: Path) -> None:
+    oversized_handler = b"#" + (b"a" * ZipScanner.MAX_MAR_PYTHON_ANALYSIS_BYTES)
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries={"handler.py": oversized_handler},
+        filename="oversized_handler.mar",
+    )
+
+    result = core.scan_file(str(mar_path))
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+    assert result.scanner_name == "zip"
+    assert len(handler_failures) == 1
+    assert handler_failures[0].severity == IssueSeverity.WARNING
+    assert "oversized entry" in handler_failures[0].message.lower()

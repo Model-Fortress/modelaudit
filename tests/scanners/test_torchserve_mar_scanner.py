@@ -419,3 +419,5 @@ def test_core_mar_fallback_bounds_python_handler_analysis_size(tmp_path: Path) -
     assert len(handler_failures) == 1
     assert handler_failures[0].severity == IssueSeverity.WARNING
     assert "oversized entry" in handler_failures[0].message.lower()
+    assert handler_failures[0].details["entry_size"] == len(oversized_handler)
+    assert handler_failures[0].details["size_limit"] == ZipScanner.MAX_MAR_PYTHON_ANALYSIS_BYTES

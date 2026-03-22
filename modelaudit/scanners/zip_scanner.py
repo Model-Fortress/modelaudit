@@ -376,7 +376,7 @@ class ZipScanner(BaseScanner):
 
                         try:
                             if archive_ext == ".mar" and name.lower().endswith(".py"):
-                                mar_python_result = self._scan_mar_python_entry(path, name, tmp_path)
+                                mar_python_result = self._scan_mar_python_entry(path, name, tmp_path, total_size)
                                 if mar_python_result is not None:
                                     result.merge(mar_python_result)
 
@@ -418,15 +418,37 @@ class ZipScanner(BaseScanner):
         result.finish(success=not result.has_errors)
         return result
 
-    def _scan_mar_python_entry(self, archive_path: str, entry_name: str, extracted_path: str) -> ScanResult | None:
+    def _scan_mar_python_entry(
+        self,
+        archive_path: str,
+        entry_name: str,
+        extracted_path: str,
+        entry_size: int,
+    ) -> ScanResult | None:
         """Apply TorchServe-style Python handler analysis for manifest-less `.mar` fallback."""
         max_analysis_bytes = self.config.get("max_mar_python_analysis_bytes", self.MAX_MAR_PYTHON_ANALYSIS_BYTES)
         if not isinstance(max_analysis_bytes, int) or max_analysis_bytes <= 0:
             max_analysis_bytes = self.MAX_MAR_PYTHON_ANALYSIS_BYTES
 
+        if entry_size > max_analysis_bytes:
+            result = ScanResult(scanner_name=self.name)
+            result.add_check(
+                name="TorchServe Handler Static Analysis",
+                passed=False,
+                message=(
+                    f"Skipped Python handler static analysis for oversized entry ({entry_size} bytes); "
+                    f"limit is {max_analysis_bytes} bytes"
+                ),
+                severity=IssueSeverity.WARNING,
+                location=f"{archive_path}:{entry_name}",
+                details={"entry": entry_name, "entry_size": entry_size, "size_limit": max_analysis_bytes},
+            )
+            result.finish(success=False)
+            return result
+
         try:
             with open(extracted_path, "rb") as source_file:
-                source_bytes = source_file.read(max_analysis_bytes + 1)
+                source_bytes = source_file.read()
         except OSError as exc:
             result = ScanResult(scanner_name=self.name)
             result.add_check(
@@ -436,22 +458,6 @@ class ZipScanner(BaseScanner):
                 severity=IssueSeverity.WARNING,
                 location=f"{archive_path}:{entry_name}",
                 details={"entry": entry_name, "exception_type": type(exc).__name__},
-            )
-            result.finish(success=False)
-            return result
-
-        if len(source_bytes) > max_analysis_bytes:
-            result = ScanResult(scanner_name=self.name)
-            result.add_check(
-                name="TorchServe Handler Static Analysis",
-                passed=False,
-                message=(
-                    f"Skipped Python handler static analysis for oversized entry ({len(source_bytes)} bytes); "
-                    f"limit is {max_analysis_bytes} bytes"
-                ),
-                severity=IssueSeverity.WARNING,
-                location=f"{archive_path}:{entry_name}",
-                details={"entry": entry_name, "size_limit": max_analysis_bytes},
             )
             result.finish(success=False)
             return result

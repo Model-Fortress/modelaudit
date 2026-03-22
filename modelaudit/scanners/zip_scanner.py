@@ -427,7 +427,7 @@ class ZipScanner(BaseScanner):
     ) -> ScanResult | None:
         """Apply TorchServe-style Python handler analysis for manifest-less `.mar` fallback."""
         max_analysis_bytes = self.config.get("max_mar_python_analysis_bytes", self.MAX_MAR_PYTHON_ANALYSIS_BYTES)
-        if not isinstance(max_analysis_bytes, int) or max_analysis_bytes <= 0:
+        if isinstance(max_analysis_bytes, bool) or not isinstance(max_analysis_bytes, int) or max_analysis_bytes <= 0:
             max_analysis_bytes = self.MAX_MAR_PYTHON_ANALYSIS_BYTES
 
         if entry_size > max_analysis_bytes:

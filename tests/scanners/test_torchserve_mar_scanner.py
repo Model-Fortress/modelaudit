@@ -421,3 +421,17 @@ def test_core_mar_fallback_bounds_python_handler_analysis_size(tmp_path: Path) -
     assert "oversized entry" in handler_failures[0].message.lower()
     assert handler_failures[0].details["entry_size"] == len(oversized_handler)
     assert handler_failures[0].details["size_limit"] == ZipScanner.MAX_MAR_PYTHON_ANALYSIS_BYTES
+
+
+def test_core_mar_fallback_rejects_boolean_size_limit_config(tmp_path: Path) -> None:
+    mar_path = _create_mar_archive(
+        tmp_path,
+        manifest=None,
+        entries={"handler.py": b"def handle(data, context):\n    return {'ok': True}\n"},
+        filename="bool_limit.mar",
+    )
+
+    result = core.scan_file(str(mar_path), {"max_mar_python_analysis_bytes": True})
+    handler_failures = _failed_checks(result, "TorchServe Handler Static Analysis")
+    assert result.scanner_name == "zip"
+    assert len(handler_failures) == 0

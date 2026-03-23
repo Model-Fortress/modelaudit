@@ -151,9 +151,9 @@ class KerasZipScanner(BaseScanner):
         if is_known_safe_keras_layer_class(layer_class):
             return True
 
-        return self._layer_uses_allowlisted_module(layer) and self._is_known_safe_allowlisted_registered_object(
+        return self._is_known_safe_allowlisted_registered_object(
             layer_class
-        )
+        ) and not self._layer_uses_non_allowlisted_module(layer)
 
     def _should_flag_registered_object(self, layer: dict[str, Any]) -> bool:
         registered_name = layer.get("registered_name")

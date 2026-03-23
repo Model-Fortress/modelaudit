@@ -938,6 +938,7 @@ __import__('pickle').loads(data)
             str(create_configured_keras_zip(tmp_path, config, file_name="allowlisted_registered_without_module.keras"))
         )
 
+        assert all(check.name != "Custom Layer Class Detection" for check in result.checks)
         assert all(check.name != "Custom Object Detection" for check in result.checks)
 
     def test_allowlisted_module_does_not_suppress_unknown_custom_layer(self, tmp_path: Path) -> None:

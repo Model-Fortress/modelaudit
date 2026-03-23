@@ -161,15 +161,14 @@ class KerasZipScanner(BaseScanner):
             return False
 
         normalized_registered_name = registered_name.strip()
-        has_allowlisted_module = self._layer_uses_allowlisted_module(layer)
         has_non_allowlisted_module = self._layer_uses_non_allowlisted_module(layer)
         layer_class = layer.get("class_name")
         if isinstance(layer_class, str) and normalized_registered_name == layer_class.strip():
-            if self._is_known_safe_serialized_layer(layer):
+            if self._is_known_safe_serialized_layer(layer) or self._is_known_safe_allowlisted_registered_object(
+                layer_class
+            ):
                 return has_non_allowlisted_module
-            return has_non_allowlisted_module or not (
-                has_allowlisted_module and self._is_known_safe_allowlisted_registered_object(layer_class)
-            )
+            return True
 
         if is_known_safe_keras_layer_class(normalized_registered_name):
             return has_non_allowlisted_module

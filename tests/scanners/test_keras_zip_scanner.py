@@ -910,6 +910,36 @@ __import__('pickle').loads(data)
         assert all(check.name != "Custom Layer Class Detection" for check in result.checks)
         assert all(check.name != "Custom Object Detection" for check in result.checks)
 
+    def test_allowlisted_registered_object_without_module_does_not_false_positive_custom_object(
+        self, tmp_path: Path
+    ) -> None:
+        """Allowlisted registered objects should not need module metadata to suppress custom-object warnings."""
+        scanner = KerasZipScanner()
+        config = {
+            "class_name": "Functional",
+            "config": {
+                "layers": [
+                    {
+                        "class_name": "InputLayer",
+                        "name": "input_1",
+                        "config": {"batch_shape": [None, 4]},
+                    },
+                    {
+                        "class_name": "NotEqual",
+                        "name": "not_equal",
+                        "registered_name": "NotEqual",
+                        "config": {},
+                    },
+                ]
+            },
+        }
+
+        result = scanner.scan(
+            str(create_configured_keras_zip(tmp_path, config, file_name="allowlisted_registered_without_module.keras"))
+        )
+
+        assert all(check.name != "Custom Object Detection" for check in result.checks)
+
     def test_allowlisted_module_does_not_suppress_unknown_custom_layer(self, tmp_path: Path) -> None:
         """Unknown classes must still be flagged even if module metadata looks Keras-owned."""
         scanner = KerasZipScanner()

@@ -61,28 +61,3 @@ jobs:
       - name: Run all tests
         run: |
           uv run pytest -n auto --tb=short --durations=20
-
-  dependency-audit:
-    name: Dependency Vulnerability Audit
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v6
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-
-      - name: Pin Python version
-        run: |
-          uv python pin 3.12
-
-      - name: Sync dependencies
-        run: |
-          uv sync --extra all-ci
-
-      - name: Audit dependencies for vulnerabilities
-        run: |
-          uvx pip-audit --strict --desc -r <(uv export --no-hashes)

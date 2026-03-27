@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - harden pickle CVE-2026-24747 SETITEM detection against stack-neutral padding
 - count successful `stream://` scans in `files_scanned` so clean streaming scans return exit code 0 instead of 2
+- scan follow-on pickle streams after large padding blocks
 - **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
 - reject local streaming symlink traversal outside the scan root
 - require explicit remote Hugging Face provenance for whitelist downgrades

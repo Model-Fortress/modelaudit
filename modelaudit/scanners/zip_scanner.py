@@ -50,6 +50,15 @@ class ZipScanner(BaseScanner):
             return 0
         return max(depth, 0)
 
+    def _get_archive_depth(self) -> int:
+        """Return the current shared archive depth from config."""
+        raw_depth = self.config.get("_archive_depth", 0)
+        try:
+            depth = int(raw_depth)
+        except (TypeError, ValueError):
+            return 0
+        return max(depth, 0)
+
     @classmethod
     def can_handle(cls, path: str) -> bool:
         """Check if this scanner can handle the given path"""
@@ -93,8 +102,13 @@ class ZipScanner(BaseScanner):
             # Store the file path for use in issue locations
             self.current_file_path = path
 
-            # Scan the zip file recursively
-            scan_result = self._scan_zip_file(path, depth=self._get_zip_depth())
+            # Scan the zip file recursively. Shared archive depth must survive
+            # scanner handoffs, while nested ZIP recursion still needs its own
+            # counter for extensionless ZIP members routed through core dispatch.
+            scan_result = self._scan_zip_file(
+                path,
+                depth=max(self._get_archive_depth(), self._get_zip_depth()),
+            )
             result.merge(scan_result)
 
         except zipfile.BadZipFile:
@@ -373,11 +387,13 @@ class ZipScanner(BaseScanner):
                         from .. import core
 
                         nested_config = dict(self.config)
+                        nested_config["_archive_depth"] = depth + 1
                         if zipfile.is_zipfile(tmp_path):
                             nested_config["_zip_depth"] = depth + 1
 
                         # Use core.scan_file so ZIP-based formats still reach their
-                        # specialized scanners, while nested generic ZIPs retain depth.
+                        # specialized scanners, while shared archive depth remains
+                        # consistent across mixed ZIP/TAR/MAR recursion.
                         file_result = core.scan_file(tmp_path, nested_config)
                         self._rewrite_nested_result_context(file_result, tmp_path, path, name)
 

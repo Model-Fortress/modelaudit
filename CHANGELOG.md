@@ -35,6 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers
 - treat all-uppercase pickle module segments as plausible imports
 - recurse into extensionless nested ZIP members by content
+- preserve mixed ZIP/TAR/MAR archive depth limits
 - **security:** bound embedded `.keras` weight extraction before temporary-file inspection to reduce zip-bomb denial-of-service risk
 - **security:** prevent ExecuTorch binary ZIP polyglots from bypassing archive scanning
 - **security:** keep spoofed built-in Keras `registered_name` values from hiding non-allowlisted custom modules in `.keras` ZIP scans

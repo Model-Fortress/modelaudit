@@ -247,7 +247,11 @@ def _path_has_part(path: Path, part: str) -> bool:
 def _find_hf_cache_root(path: Path) -> Path | None:
     """Return the HuggingFace cache root containing models--* if present."""
     for index, segment in enumerate(path.parts):
-        if segment.lower().startswith("models--"):
+        if (
+            segment.lower().startswith("models--")
+            and index >= 3
+            and [part.lower() for part in path.parts[index - 3 : index]] == [".cache", "huggingface", "hub"]
+        ):
             return Path(*path.parts[: index + 1])
     return None
 
@@ -1171,16 +1175,26 @@ def _is_huggingface_cache_file(path: str) -> bool:
     import os
 
     filename = os.path.basename(path)
+    path_obj = Path(path)
 
-    # HuggingFace cache file patterns - be more specific
-    hf_cache_patterns = [
-        ".lock",  # Download lock files
-        ".metadata",  # HuggingFace metadata files
-    ]
+    # Download lock files are HuggingFace bookkeeping files regardless of cache layout.
+    if filename.endswith(".lock"):
+        return True
 
-    # Check if file ends with cache patterns
-    for pattern in hf_cache_patterns:
-        if filename.endswith(pattern):
+    # Only skip HuggingFace .metadata files in known cache/download layouts.
+    if filename.endswith(".metadata"):
+        hf_cache_root = _find_hf_cache_root(path_obj)
+        if hf_cache_root is not None and hf_cache_root.parent.name.lower() == "hub":
+            try:
+                relative_parts = path_obj.relative_to(hf_cache_root).parts
+            except ValueError:
+                relative_parts = ()
+
+            if relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"}:
+                return True
+
+        normalized_parts = [part.lower() for part in path_obj.parent.parts]
+        if len(normalized_parts) >= 3 and normalized_parts[-3:] == [".cache", "huggingface", "download"]:
             return True
 
     # Check for specific HuggingFace cache metadata files

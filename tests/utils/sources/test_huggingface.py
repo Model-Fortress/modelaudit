@@ -136,6 +136,23 @@ class TestExtractModelIdFromPath:
 
         assert extract_model_id_from_path(str(model_path)) == (None, None)
 
+    def test_extract_model_id_rejects_spoofed_hf_cache_root(self, tmp_path: Path) -> None:
+        """Only the real .cache/huggingface/hub layout should count as HF cache provenance."""
+        model_path = (
+            tmp_path
+            / "project"
+            / "huggingface"
+            / "hub"
+            / "models--Qwen--Qwen2.5-0.5B"
+            / "snapshots"
+            / "abc123"
+            / "weights.bin"
+        )
+        model_path.parent.mkdir(parents=True)
+        model_path.write_bytes(b"weights")
+
+        assert extract_model_id_from_path(str(model_path)) == (None, None)
+
 
 class TestModelDownload:
     """Test model downloading functionality."""

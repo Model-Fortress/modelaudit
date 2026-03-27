@@ -494,7 +494,11 @@ def _path_has_part(path: Path, part: str) -> bool:
 def _find_hf_cache_root(path: Path) -> Path | None:
     """Return the HuggingFace cache root containing models--* if present."""
     for index, segment in enumerate(path.parts):
-        if segment.startswith("models--"):
+        if (
+            segment.lower().startswith("models--")
+            and index >= 3
+            and [part.lower() for part in path.parts[index - 3 : index]] == [".cache", "huggingface", "hub"]
+        ):
             return Path(*path.parts[: index + 1])
     return None
 
@@ -503,7 +507,7 @@ def is_huggingface_cache_path(path: str | Path) -> bool:
     """Return True if a path is inside a HuggingFace cache layout."""
     path_obj = Path(path)
     cache_root = _find_hf_cache_root(path_obj)
-    if cache_root is None or not _path_has_part(cache_root, "huggingface"):
+    if cache_root is None:
         return False
 
     try:
@@ -511,10 +515,7 @@ def is_huggingface_cache_path(path: str | Path) -> bool:
     except ValueError:
         return False
 
-    if relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"}:
-        return True
-
-    return any((cache_root / cache_part).exists() for cache_part in ("snapshots", "blobs", "refs"))
+    return bool(relative_parts and relative_parts[0] in {"snapshots", "blobs", "refs"})
 
 
 def extract_model_id_from_path(path: str) -> tuple[str | None, str | None]:

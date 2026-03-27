@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
 - reject local streaming symlink traversal outside the scan root
 - require explicit remote Hugging Face provenance for whitelist downgrades
+- preserve scannable archives, hidden model files, hidden DVC pointers, and local `.metadata` files in directory scans
+- tighten Hugging Face cache-root matching so only real `.cache/huggingface/hub` layouts get cache-specific filtering and provenance handling
 - preserve validated PE detections in pickle binary ML-context filtering
 - **security:** fail closed on pickle opcode parse errors for `.pkl` / `.pickle` / `.joblib` / `.dill` files instead of returning a successful INFO-only scan
 - **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers

@@ -163,6 +163,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers
 - **security:** detect nested pickle payloads in BINBYTES8 and BYTEARRAY8 opcodes
 - preserve validated PE detections in pickle binary ML-context filtering
+- reject local streaming symlink traversal outside the scan root
 - **security:** bound embedded `.keras` weight extraction before temporary-file inspection to reduce zip-bomb denial-of-service risk
 - **security:** prevent ExecuTorch binary ZIP polyglots from bypassing archive scanning
 - **security:** keep spoofed built-in Keras `registered_name` values from hiding non-allowlisted custom modules in `.keras` ZIP scans

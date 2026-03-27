@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - preserve validated PE detections in pickle binary ML-context filtering
 - **security:** fail closed on pickle opcode parse errors for `.pkl` / `.pickle` / `.joblib` / `.dill` files instead of returning a successful INFO-only scan
 - **security:** preserve full scanner execution for large files when scanners do not implement chunk analyzers
+- treat all-uppercase pickle module segments as plausible imports
 - recurse into extensionless nested ZIP members by content
 - **security:** bound embedded `.keras` weight extraction before temporary-file inspection to reduce zip-bomb denial-of-service risk
 - **security:** prevent ExecuTorch binary ZIP polyglots from bypassing archive scanning

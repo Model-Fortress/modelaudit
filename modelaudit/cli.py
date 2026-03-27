@@ -31,7 +31,7 @@ from .integrations.jfrog import scan_jfrog_artifact
 from .integrations.sarif_formatter import format_sarif_output
 from .models import ModelAuditResultModel
 from .rules import Rule, RuleRegistry, Severity
-from .scanners.base import IssueSeverity
+from .scanners.base import IssueSeverity, make_trusted_source_provenance
 from .telemetry import (
     flush_telemetry,
     record_command_used,
@@ -54,6 +54,7 @@ from .utils.sources.cloud_storage import download_from_cloud, is_cloud_url
 from .utils.sources.huggingface import (
     download_file_from_hf,
     download_model,
+    extract_model_id_from_path,
     is_huggingface_file_url,
     is_huggingface_url,
 )
@@ -1069,6 +1070,8 @@ def scan_command(
             actual_path = path
             should_break = False
             url_handled = False  # Track if we handled a URL download
+            source_model_id: str | None = None
+            source_model_source: str | None = None
 
             try:
                 # Check if this is a direct HuggingFace file URL
@@ -1102,6 +1105,7 @@ def scan_command(
                         # Download single file
                         download_path = download_file_from_hf(path, cache_dir=hf_cache_dir)
                         actual_path = str(download_path)
+                        source_model_id, source_model_source = extract_model_id_from_path(path)
                         # Only track for cleanup if we created an ephemeral cache above
                         temp_dir = str(hf_cache_dir) if not final_cache else None
 
@@ -1162,6 +1166,7 @@ def scan_command(
                             pass
 
                     try:
+                        source_model_id, source_model_source = extract_model_id_from_path(path)
                         # Convert cache_dir string to Path if provided
                         hf_cache_dir = None
                         if final_cache and final_cache_dir:
@@ -1174,6 +1179,12 @@ def scan_command(
                         record_download_started("huggingface", path)
                         record_feature_used("huggingface_download", cache_enabled=final_cache)
                         download_start = time.time()
+                        trusted_source_provenance = None
+                        if source_model_id and source_model_source == "huggingface":
+                            trusted_source_provenance = make_trusted_source_provenance(
+                                source_model_id,
+                                source_model_source,
+                            )
 
                         # Choose between streaming and normal download mode
                         if final_scan_and_delete:
@@ -1192,6 +1203,10 @@ def scan_command(
                             )
 
                             # Scan with streaming mode - propagate all config
+                            streaming_kwargs: dict[str, Any] = {}
+                            if trusted_source_provenance is not None:
+                                streaming_kwargs["_trusted_source_provenance"] = trusted_source_provenance
+
                             streaming_result = scan_model_streaming(
                                 file_generator=file_generator,
                                 timeout=final_timeout,
@@ -1203,6 +1218,7 @@ def scan_command(
                                 skip_file_types=final_skip_files,
                                 cache_enabled=final_cache,
                                 cache_dir=final_cache_dir,
+                                **streaming_kwargs,
                             )
 
                             # Merge streaming results into audit_result
@@ -1817,6 +1833,11 @@ def scan_command(
                         "cache_enabled": final_cache,
                         "cache_dir": final_cache_dir,
                     }
+                    if source_model_id and source_model_source == "huggingface":
+                        config_overrides["_trusted_source_provenance"] = make_trusted_source_provenance(
+                            source_model_id,
+                            source_model_source,
+                        )
 
                     # Record feature usage for large model support (based on automatic defaults)
                     # Note: DO NOT send actual path - only track that the feature was used

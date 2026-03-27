@@ -844,6 +844,9 @@ def test_scan_huggingface_url_success(mock_rmtree, mock_scan, mock_download, moc
     mock_scan.assert_called_once()
     call_args = mock_scan.call_args
     assert call_args[0][0] == str(test_model_dir)
+    provenance = call_args.kwargs["_trusted_source_provenance"]
+    assert provenance.model_id == "test/model"
+    assert provenance.model_source == "huggingface"
 
     # Verify cleanup was attempted (only when not using cache)
     mock_rmtree.assert_called()
@@ -1002,6 +1005,9 @@ def test_scan_huggingface_streaming_success(mock_scan_streaming, mock_download_s
     # Verify streaming functions were called
     mock_download_streaming.assert_called_once()
     mock_scan_streaming.assert_called_once()
+    streaming_provenance = mock_scan_streaming.call_args.kwargs["_trusted_source_provenance"]
+    assert streaming_provenance.model_id == "test/streaming-model"
+    assert streaming_provenance.model_source == "huggingface"
 
     # Verify content_hash is in JSON output
     try:

@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **safetensors:** include BOOL, BF16, F8_E4M3, and F8_E5M2 dtypes in tensor-size validation so malformed offsets are no longer skipped
 - harden pickle symbolic stack simulation by ignoring stack-neutral opcodes and using unknown sentinels for unhandled stack pushes
 - **security:** scan TensorFlow SavedModel `assets/` and `assets.extra/` directories for executable-like content (shebang scripts, ELF/Mach-O binaries, pickle magic, and embedded Python source patterns)
 - **security:** enforce SafeTensors `MAX_HEADER_BYTES` during `scan()` and skip regex-heavy metadata-content analysis when headers exceed the configured limit to reduce header-based DoS risk

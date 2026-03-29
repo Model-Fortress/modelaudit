@@ -63,6 +63,35 @@ def _make_opcode_padding_stream(opcode_pairs: int) -> bytes:
     return b"\x80\x02" + (b"K\x010" * opcode_pairs) + b"."
 
 
+def _make_memo_expansion_pickle(iterations: int, *, inert_writes: int = 0) -> bytes:
+    total_writes = iterations + inert_writes
+    if not 1 <= iterations <= 255 or total_writes > 255:
+        raise ValueError("iterations + inert_writes must fit in BINPUT/BINGET opcodes")
+
+    payload = bytearray(b"\x80\x02)q\x000")
+    for memo_index in range(1, iterations + 1):
+        previous_index = memo_index - 1
+        payload += b"h" + bytes([previous_index])
+        payload += b"h" + bytes([previous_index])
+        payload += b"\x86"
+        payload += b"q" + bytes([memo_index])
+        payload += b"0"
+    for memo_index in range(iterations + 1, total_writes + 1):
+        payload += b"K\x01"
+        payload += b"q" + bytes([memo_index])
+        payload += b"0"
+    payload += b"h" + bytes([iterations]) + b"."
+    return bytes(payload)
+
+
+def _make_dup_heavy_pickle(iterations: int) -> bytes:
+    payload = bytearray(b"\x80\x02]q\x00")
+    for _ in range(iterations):
+        payload += b"h\x002a0"
+    payload += b"."
+    return bytes(payload)
+
+
 @pytest.mark.parametrize(
     "fixture_name",
     [
@@ -420,6 +449,114 @@ def test_post_budget_global_scan_uses_consumed_opcode_boundary(tmp_path: Path) -
     expected_minimum_offset = len(b"\x80\x04") + len(b"\x8d") + struct.calcsize("<Q") + 120
     assert checks[0].details["minimum_offset"] == expected_minimum_offset
     assert result.success is True
+
+
+def test_pickle_expansion_heuristics_detect_iterative_memo_growth(tmp_path: Path) -> None:
+    """Repeated memo growth chains should surface a dedicated expansion warning."""
+    pickle_path = tmp_path / "memo-expansion.pkl"
+    pickle_path.write_bytes(_make_memo_expansion_pickle(iterations=80))
+
+    result = PickleScanner().scan(str(pickle_path))
+
+    expansion_checks = [
+        check
+        for check in result.checks
+        if check.name == "Pickle Expansion Heuristic Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(expansion_checks) == 1, f"Expected one failed expansion heuristic check, got: {result.checks}"
+    check = expansion_checks[0]
+    assert check.severity == IssueSeverity.WARNING
+    assert any("memo_growth_chain" in finding["triggers"] for finding in check.details["findings"]), check.details
+
+
+def test_pickle_expansion_heuristics_detect_diluted_memo_growth(tmp_path: Path) -> None:
+    """Inert memo writes must not suppress a real memo-growth expansion chain."""
+    pickle_path = tmp_path / "memo-expansion-diluted.pkl"
+    pickle_path.write_bytes(_make_memo_expansion_pickle(iterations=80, inert_writes=80))
+
+    result = PickleScanner().scan(str(pickle_path))
+
+    expansion_checks = [
+        check
+        for check in result.checks
+        if check.name == "Pickle Expansion Heuristic Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(expansion_checks) == 1, f"Expected one failed expansion heuristic check, got: {result.checks}"
+    check = expansion_checks[0]
+    assert any("memo_growth_chain" in finding["triggers"] for finding in check.details["findings"]), check.details
+
+
+def test_pickle_expansion_heuristics_detect_dup_heavy_payload(tmp_path: Path) -> None:
+    """Dense DUP usage with extreme memo recall should trigger the expansion heuristics."""
+    pickle_path = tmp_path / "dup-heavy.pkl"
+    pickle_path.write_bytes(_make_dup_heavy_pickle(iterations=200))
+
+    loaded = pickle.loads(pickle_path.read_bytes())
+    result = PickleScanner().scan(str(pickle_path))
+
+    expansion_checks = [
+        check
+        for check in result.checks
+        if check.name == "Pickle Expansion Heuristic Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(expansion_checks) == 1, f"Expected one failed expansion heuristic check, got: {result.checks}"
+    assert len(loaded) == 200
+    assert loaded[0] is loaded
+    check = expansion_checks[0]
+    assert check.severity == IssueSeverity.WARNING
+    assert any("excessive_dup_usage" in finding["triggers"] for finding in check.details["findings"]), check.details
+    assert any("suspicious_get_put_ratio" in finding["triggers"] for finding in check.details["findings"]), (
+        check.details
+    )
+
+
+def test_pickle_expansion_heuristics_ignore_benign_shared_reference_payload(tmp_path: Path) -> None:
+    """Shared references alone should not trip the expansion heuristics."""
+    shared = [1, 2, 3]
+    pickle_path = tmp_path / "shared-reference.pkl"
+    pickle_path.write_bytes(pickle.dumps([shared] * 1000, protocol=4))
+
+    result = PickleScanner().scan(str(pickle_path))
+
+    expansion_checks = [check for check in result.checks if check.name == "Pickle Expansion Heuristic Check"]
+    assert len(expansion_checks) == 1, f"Expected one expansion heuristic check, got: {result.checks}"
+    assert expansion_checks[0].status == CheckStatus.PASSED
+    assert not any(
+        check.name == "Pickle Expansion Heuristic Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    ), f"Unexpected expansion heuristic finding: {result.checks}"
+    assert not any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def test_post_budget_expansion_scan_detects_follow_on_stream(tmp_path: Path) -> None:
+    """A later-stream expansion bomb must still be detected after the opcode budget is exhausted."""
+    pickle_path = tmp_path / "post-budget-expansion.pkl"
+    pickle_path.write_bytes(_make_opcode_padding_stream(64) + _make_memo_expansion_pickle(iterations=80))
+
+    result = PickleScanner({"max_opcodes": 64, "post_budget_expansion_scan_limit_bytes": 4096}).scan(str(pickle_path))
+
+    post_budget_checks = [
+        check
+        for check in result.checks
+        if check.name == "Post-Budget Pickle Expansion Heuristic Check" and check.status == CheckStatus.FAILED
+    ]
+    assert len(post_budget_checks) == 1, f"Expected one failed post-budget expansion check, got: {result.checks}"
+    assert any(
+        "memo_growth_chain" in finding["triggers"] for finding in post_budget_checks[0].details["findings"]
+    ), post_budget_checks[0].details
+
+
+def test_post_budget_expansion_scan_ignores_benign_follow_on_stream(tmp_path: Path) -> None:
+    """A benign later stream must not trigger the post-budget expansion heuristic."""
+    pickle_path = tmp_path / "post-budget-benign.pkl"
+    pickle_path.write_bytes(_make_opcode_padding_stream(64) + pickle.dumps({"safe": True}, protocol=2))
+
+    result = PickleScanner({"max_opcodes": 64, "post_budget_expansion_scan_limit_bytes": 4096}).scan(str(pickle_path))
+
+    assert not any(
+        check.name == "Post-Budget Pickle Expansion Heuristic Check" and check.status == CheckStatus.FAILED
+        for check in result.checks
+    ), result.checks
 
 
 @pytest.mark.parametrize(

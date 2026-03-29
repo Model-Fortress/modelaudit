@@ -4025,7 +4025,7 @@ class PickleScanner(BaseScanner):
     def _is_zip_backed_pytorch_container(path: str) -> bool:
         """Return whether the path is a ZIP-backed PyTorch-style container."""
         file_ext = os.path.splitext(path)[1].lower()
-        if file_ext not in {".bin", ".pt", ".pth", ".ckpt"}:
+        if file_ext not in {".bin", ".pt", ".pth", ".ckpt", ".pkl"}:
             return False
 
         try:

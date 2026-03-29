@@ -48,6 +48,47 @@ logger = logging.getLogger("modelaudit.core")
 _OPERATIONAL_ERROR_METADATA_KEY = "operational_error"
 _OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
 
+HEADER_FORMAT_TO_SCANNER_ID = {
+    "pickle": "pickle",
+    "pytorch_binary": "pytorch_binary",
+    "hdf5": "keras_h5",
+    "keras": "keras_h5",
+    "safetensors": "safetensors",
+    "tensorflow_directory": "tf_savedmodel",
+    "protobuf": "tf_savedmodel",
+    "tf_metagraph": "tf_metagraph",
+    "tar": "tar",
+    "zip": "zip",
+    "onnx": "onnx",
+    "gguf": "gguf",
+    "ggml": "gguf",
+    "numpy": "numpy",
+    "openvino": "openvino",
+    "pmml": "pmml",
+    "cntk": "cntk",
+    "lightgbm": "lightgbm",
+    "torch7": "torch7",
+    "catboost": "catboost",
+    "rknn": "rknn",
+    "mxnet": "mxnet",
+    "nemo": "nemo",
+    "llamafile": "llamafile",
+    "tflite": "tflite",
+    "coreml": "coreml",
+    "paddle": "paddle",
+    "tensorrt": "tensorrt",
+    "flax_msgpack": "flax_msgpack",
+    "r_serialized": "r_serialized",
+    "executorch": "executorch",
+    "compressed": "compressed",
+    "sevenzip": "sevenzip",
+    "skops": "skops",
+    "torchserve_mar": "torchserve_mar",
+    "joblib": "joblib",
+    "xgboost": "xgboost",
+    "jax_checkpoint": "jax_checkpoint",
+}
+
 
 def _mark_operational_scan_error(scan_result: ScanResult, reason: str) -> None:
     """Mark a scan result as an operational failure for exit-code aggregation."""
@@ -1391,12 +1432,12 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         )
         logger.warning(discrepancy_msg)
     elif header_format != ext_format and header_format != "unknown" and ext_format != "unknown":
-        # Don't warn about common PyTorch .bin files that are ZIP or pickle format internally
-        # This is expected behavior for torch.save() and HuggingFace models
+        # Suppress expected container-vs-extension differences for known wrapper formats.
         if not (
             (ext_format == "pytorch_binary" and header_format in ["zip", "pickle"] and ext == ".bin")
             or (ext_format == "pytorch_binary" and header_format == "pickle" and ext in [".pt", ".pth"])
             or (ext_format == "keras" and header_format in ["zip", "hdf5"])
+            or (ext_format == "skops" and header_format == "zip" and ext == ".skops")
         ):
             discrepancy_msg = f"File extension indicates {ext_format} but header indicates {header_format}."
             logger.debug(discrepancy_msg)
@@ -1406,11 +1447,11 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
 
     # Special handling for PyTorch files that are ZIP-based
     # PyTorch's torch.save() uses ZIP format by default since v1.6 (_use_new_zipfile_serialization=True)
-    # This applies to .pt, .pth, and .pkl files saved with torch.save()
+    # This applies to .pt, .pth, .ckpt, and .pkl files saved with torch.save()
     if header_format == "zip" and ext == ".keras":
         # Keras 3.x .keras files are ZIP archives - use the dedicated Keras ZIP scanner
         preferred_scanner = _registry.load_scanner_by_id("keras_zip")
-    elif header_format == "zip" and ext in [".pt", ".pth", ".pkl"]:
+    elif header_format == "zip" and ext in [".pt", ".pth", ".ckpt", ".pkl"]:
         preferred_scanner = _registry.load_scanner_by_id("pytorch_zip")
     elif header_format == "zip" and ext == ".bin":
         # PyTorch .bin files saved with torch.save() are ZIP format internally
@@ -1420,21 +1461,7 @@ def _scan_file_internal(path: str, config: dict[str, Any] | None = None) -> Scan
         # TorchServe .mar model archives are ZIP-based - use dedicated MAR scanner
         preferred_scanner = _registry.load_scanner_by_id("torchserve_mar")
     else:
-        format_to_scanner = {
-            "pickle": "pickle",
-            "pytorch_binary": "pytorch_binary",
-            "hdf5": "keras_h5",
-            "safetensors": "safetensors",
-            "tensorflow_directory": "tf_savedmodel",
-            "protobuf": "tf_savedmodel",
-            "tar": "tar",
-            "zip": "zip",
-            "onnx": "onnx",
-            "gguf": "gguf",
-            "ggml": "gguf",
-            "numpy": "numpy",
-        }
-        scanner_id = format_to_scanner.get(header_format)
+        scanner_id = HEADER_FORMAT_TO_SCANNER_ID.get(header_format)
         if scanner_id:
             preferred_scanner = _registry.load_scanner_by_id(scanner_id)
 

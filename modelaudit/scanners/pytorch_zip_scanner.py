@@ -20,12 +20,12 @@ _INSTALLED_PYTORCH_VERSION_UNSET = object()
 
 
 class PyTorchZipScanner(BaseScanner):
-    """Scanner for PyTorch Zip-based model files (.pt, .pth, .pkl, .bin)"""
+    """Scanner for PyTorch ZIP-based model files (.pt, .pth, .ckpt, .pkl, .bin)."""
 
     name = "pytorch_zip"
     description = "Scans PyTorch model files for suspicious code in embedded pickles"
-    # Include .pkl since torch.save() uses ZIP format by default since PyTorch 1.6
-    supported_extensions: ClassVar[list[str]] = [".pt", ".pth", ".pkl", ".bin"]
+    # Include .pkl and .ckpt since torch.save() commonly uses ZIP containers for both.
+    supported_extensions: ClassVar[list[str]] = [".pt", ".pth", ".ckpt", ".pkl", ".bin"]
 
     # CVE-2025-32434 constants
     CVE_2025_32434_ID: ClassVar[str] = "CVE-2025-32434"
@@ -93,9 +93,9 @@ class PyTorchZipScanner(BaseScanner):
         if ext not in cls.supported_extensions:
             return False
 
-        # For .bin and .pkl files, only handle if they're ZIP format (torch.save() output)
+        # For .bin, .pkl, and .ckpt files, only handle ZIP-backed containers.
         # torch.save() uses ZIP format by default since PyTorch 1.6 (_use_new_zipfile_serialization=True)
-        if ext in [".bin", ".pkl"]:
+        if ext in [".bin", ".pkl", ".ckpt"]:
             try:
                 from modelaudit.utils.file.detection import detect_file_format
 
@@ -103,7 +103,7 @@ class PyTorchZipScanner(BaseScanner):
             except Exception:
                 return False
 
-        # For .pt and .pth, always try to handle
+        # For .pt and .pth, always try to handle.
         return True
 
     def scan(self, path: str, timeout: int | None = None) -> ScanResult:

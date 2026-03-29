@@ -898,6 +898,7 @@ EXTENSION_FORMAT_MAP = {
     ".npy": "numpy",
     ".npz": "zip",
     ".joblib": "pickle",  # joblib can be either zip or pickle format
+    ".skops": "skops",
     ".pdmodel": "paddle",
     ".pdiparams": "paddle",
     ".params": "mxnet",
@@ -979,6 +980,8 @@ def detect_format_from_extension_pattern_matching(extension: FileExtension) -> F
             return "pmml"
         case ".npy" | ".npz":
             return "numpy"
+        case ".skops":
+            return "skops"
         case ".msgpack":
             return "flax_msgpack"
         case ".nemo":
@@ -1128,6 +1131,10 @@ def validate_file_type(path: str) -> bool:
             if file_path.suffix.lower() == ".npz":
                 return header_format in {"zip", "numpy"}
             return header_format == "numpy"
+
+        # skops files are ZIP containers by design.
+        if ext_format == "skops":
+            return header_format in {"skops", "zip"}
 
         # PaddlePaddle files: .pdmodel files are protobuf serialised program
         # descriptors and .pdiparams files are raw binary weight tensors.

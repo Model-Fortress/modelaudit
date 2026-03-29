@@ -113,7 +113,7 @@ def test_direct_pickle_scanner_routes_zip_backed_malicious_pt_fixture() -> None:
     ), f"Expected ZIP validation check, got: {[(check.name, check.status.value) for check in result.checks]}"
 
 
-@pytest.mark.parametrize("container_ext", [".pt", ".pth", ".bin", ".ckpt"])
+@pytest.mark.parametrize("container_ext", [".pt", ".pth", ".bin", ".ckpt", ".pkl"])
 def test_direct_pickle_scanner_routes_zip_backed_safe_pytorch_containers(container_ext: str, tmp_path: Path) -> None:
     """ZIP-backed PyTorch containers should scan as PyTorch ZIP regardless of extension."""
     fixture_path = PYTORCH_FIXTURE_DIR / "safe_model.pt"

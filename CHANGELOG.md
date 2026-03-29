@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- propagate CLI cache settings into MLflow and JFrog downloads
 - avoid materializing streaming directory iterators in memory
 - fail closed when JFrog folder downloads return only partial results
 - **keras:** anchor safe Lambda normalization regexes in H5 scanning so appended statements (for example `; __import__(...)`) cannot bypass dangerous-code analysis

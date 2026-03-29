@@ -2617,6 +2617,10 @@ def _simulate_symbolic_reference_maps(
             continue
 
         if name == "BUILD":
+            if len(stack) >= 2:
+                target = stack[-2]
+                if isinstance(target, _MutationTargetRef):
+                    mutation_target_refs[i] = target
             _pop()
             continue
 
@@ -3400,6 +3404,7 @@ def is_dangerous_reduce_pattern(
     stack_global_refs: dict[int, tuple[str, str]] | None = None,
     callable_refs: dict[int, tuple[str, str]] | None = None,
     callable_origin_is_ext: dict[int, bool] | None = None,
+    mutation_target_refs: dict[int, _MutationTargetRef] | None = None,
 ) -> dict[str, Any] | None:
     """
     Check for patterns that indicate a dangerous __reduce__ method.
@@ -3432,26 +3437,35 @@ def is_dangerous_reduce_pattern(
         # Check SUSPICIOUS_GLOBALS (the fallback)
         return is_suspicious_global(mod, func)
 
-    if stack_global_refs is None or callable_refs is None or callable_origin_is_ext is None:
+    if (
+        stack_global_refs is None
+        or callable_refs is None
+        or callable_origin_is_ext is None
+        or mutation_target_refs is None
+    ):
         (
             computed_stack_refs,
             computed_callable_refs,
             _computed_callable_origin_refs,
             computed_callable_origin_is_ext,
             _computed_malformed_stack_globals,
-            _computed_mutation_target_refs,
+            computed_mutation_target_refs,
         ) = _simulate_symbolic_reference_maps(opcodes)
     else:
-        computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext = (
+        computed_stack_refs, computed_callable_refs, computed_callable_origin_is_ext, computed_mutation_target_refs = (
             stack_global_refs,
             callable_refs,
             callable_origin_is_ext,
+            mutation_target_refs,
         )
 
     resolved_stack_globals = stack_global_refs if stack_global_refs is not None else computed_stack_refs
     resolved_callables = callable_refs if callable_refs is not None else computed_callable_refs
     resolved_callable_origin_is_ext = (
         callable_origin_is_ext if callable_origin_is_ext is not None else computed_callable_origin_is_ext
+    )
+    resolved_mutation_targets = (
+        mutation_target_refs if mutation_target_refs is not None else computed_mutation_target_refs
     )
 
     # Look for common patterns in __reduce__ exploits
@@ -3470,6 +3484,25 @@ def is_dangerous_reduce_pattern(
                         "position": pos,
                         "opcode": opcode.name,
                         "origin_is_ext": origin_is_ext,
+                    }
+
+        # BUILD mutates a previously-constructed object and may invoke
+        # __setstate__ with attacker-controlled state.
+        if opcode.name == "BUILD":
+            target_ref = resolved_mutation_targets.get(i)
+            if target_ref and target_ref.kind == "object" and target_ref.callable_ref:
+                mod, func = target_ref.callable_ref
+                if not _is_safe_ml_global(mod, func):
+                    return {
+                        "pattern": "BUILD_SETSTATE_NON_SAFE_GLOBAL",
+                        "module": mod,
+                        "function": func,
+                        "associated_global": f"{mod}.{func}",
+                        "position": pos,
+                        "opcode": opcode.name,
+                        "description": (
+                            "BUILD applied state to object from non-safe global; potential __setstate__ exploitation"
+                        ),
                     }
 
         # Check for GLOBAL followed by REDUCE - common in exploits
@@ -3684,18 +3717,31 @@ def check_opcode_sequence(
     # Compute per-stream thresholds so appended streams are analyzed
     # independently even when the file contains mixed-size streams.
     stream_refs: dict[int, list[str]] = {stream_id: [] for stream_id in stream_lengths}
+    stream_has_dangerous_globals: dict[int, bool] = dict.fromkeys(stream_lengths, False)
 
     for idx, (mod, func) in resolved_stack_globals.items():
         if 0 <= idx < len(stream_id_by_index):
-            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+            stream_id = stream_id_by_index[idx]
+            stream_refs.setdefault(stream_id, []).append(f"{mod}.{func}")
+            if _is_actually_dangerous_global(mod, func, ml_context):
+                stream_has_dangerous_globals[stream_id] = True
 
     for idx, (mod, func) in resolved_callables.items():
         if 0 <= idx < len(stream_id_by_index):
-            stream_refs.setdefault(stream_id_by_index[idx], []).append(f"{mod}.{func}")
+            stream_id = stream_id_by_index[idx]
+            stream_refs.setdefault(stream_id, []).append(f"{mod}.{func}")
+            if resolved_callable_origin_is_ext.get(idx, False) or _is_actually_dangerous_global(mod, func, ml_context):
+                stream_has_dangerous_globals[stream_id] = True
 
     for idx, (op, arg, _p) in enumerate(opcodes):
         if op.name == "GLOBAL" and isinstance(arg, str):
-            stream_refs.setdefault(stream_id_by_index[idx], []).append(str(arg))
+            stream_id = stream_id_by_index[idx]
+            stream_refs.setdefault(stream_id, []).append(str(arg))
+            parsed = _parse_module_function(arg)
+            if parsed:
+                mod, func = parsed
+                if _is_actually_dangerous_global(mod, func, ml_context):
+                    stream_has_dangerous_globals[stream_id] = True
 
     stream_thresholds: dict[int, int] = {}
     ml_confidence_val = float(ml_context.get("overall_confidence", 0) or 0)
@@ -3712,8 +3758,14 @@ def check_opcode_sequence(
             for framework in known_tree_frameworks
         )
         has_tree_markers = any(marker in refs_str for marker in _tree_ensemble_markers)
+        has_dangerous_globals = stream_has_dangerous_globals.get(stream_id, False)
 
-        if ml_context.get("is_ml_content", False) and has_tree_framework and has_tree_markers:
+        if (
+            ml_context.get("is_ml_content", False)
+            and has_tree_framework
+            and has_tree_markers
+            and not has_dangerous_globals
+        ):
             # Tree-ensemble markers in-stream (e.g. RandomForest, DecisionTree)
             # are strong evidence of legitimate model reconstruction behavior.
             # Scale by stream size to handle large tree ensembles, with a
@@ -6688,20 +6740,22 @@ class PickleScanner(BaseScanner):
                 stack_global_refs=stack_global_refs,
                 callable_refs=callable_refs,
                 callable_origin_is_ext=callable_origin_is_ext,
+                mutation_target_refs=analysis.mutation_target_refs,
             )
             if dangerous_pattern:
                 normalized_pattern_mod, normalized_pattern_func = _normalize_import_reference(
                     dangerous_pattern.get("module", ""),
                     dangerous_pattern.get("function", ""),
                 )
+                is_build_setstate = dangerous_pattern.get("pattern") == "BUILD_SETSTATE_NON_SAFE_GLOBAL"
                 dangerous_pattern_base_severity = (
                     _dangerous_ref_base_severity(
                         normalized_pattern_mod,
                         normalized_pattern_func,
                         origin_is_ext=bool(dangerous_pattern.get("origin_is_ext")),
                     )
-                    if normalized_pattern_mod and normalized_pattern_func
-                    else IssueSeverity.CRITICAL
+                    if normalized_pattern_mod and normalized_pattern_func and not is_build_setstate
+                    else (IssueSeverity.WARNING if is_build_setstate else IssueSeverity.CRITICAL)
                 )
                 severity = _get_context_aware_severity(
                     dangerous_pattern_base_severity,
@@ -6709,12 +6763,23 @@ class PickleScanner(BaseScanner):
                     issue_type="dangerous_import",
                 )
                 module_name = dangerous_pattern.get("module", "")
-                # Get rule code for the dangerous module
-                module_name = dangerous_pattern.get("module", "")
                 func_name = dangerous_pattern.get("function", "")
-                dangerous_pattern_rule_code = get_import_rule_code(module_name, func_name)
+                dangerous_pattern_rule_code = (
+                    get_pickle_opcode_rule_code("BUILD")
+                    if is_build_setstate
+                    else get_import_rule_code(module_name, func_name)
+                )
                 if not dangerous_pattern_rule_code:
                     dangerous_pattern_rule_code = "S201"  # REDUCE opcode
+                finding_name = "BUILD Opcode Analysis" if is_build_setstate else "Reduce Pattern Analysis"
+                finding_message = (
+                    f"Detected potential __setstate__ exploitation via BUILD with {module_name}.{func_name}"
+                    if is_build_setstate
+                    else (
+                        "Detected dangerous __reduce__ pattern with "
+                        f"{dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}"
+                    )
+                )
                 location = f"{self.current_file_path} (pos {dangerous_pattern.get('position', 0)})"
                 details = {
                     **dangerous_pattern,
@@ -6723,32 +6788,55 @@ class PickleScanner(BaseScanner):
                         0,
                     ),
                 }
-                if module_name and func_name:
+                dangerous_pattern_why: str | None = (
+                    "BUILD can invoke __setstate__ on the constructed object. "
+                    "When that object comes from a non-safe global, attacker-controlled state may execute code."
+                    if is_build_setstate
+                    else get_import_explanation(f"{module_name}.{func_name}")
+                )
+                if is_build_setstate:
+                    suspicious_count += 1
+                    result.add_check(
+                        name=finding_name,
+                        passed=False,
+                        message=finding_message,
+                        severity=severity,
+                        rule_code=dangerous_pattern_rule_code,
+                        location=location,
+                        details=details,
+                        why=dangerous_pattern_why,
+                    )
+                elif module_name and func_name:
                     if _record_reference_primary(
                         (normalized_pattern_mod, normalized_pattern_func),
-                        name="Reduce Pattern Analysis",
-                        message=(
-                            "Detected dangerous __reduce__ pattern with "
-                            f"{dangerous_pattern.get('module', '')}.{dangerous_pattern.get('function', '')}"
-                        ),
+                        name=finding_name,
+                        message=finding_message,
                         severity=severity,
                         location=location,
                         details=details,
-                        why=get_import_explanation(f"{module_name}.{func_name}"),
-                    rule_code=dangerous_pattern_rule_code,
+                        why=dangerous_pattern_why,
+                        rule_code=dangerous_pattern_rule_code,
                     ):
                         suspicious_count += 1
                 else:
                     suspicious_count += 1
                     result.add_check(
-                        name="Reduce Pattern Analysis",
+                        name=finding_name,
                         passed=False,
-                        message="Detected dangerous __reduce__ pattern",
+                        message=(
+                            "Detected potential __setstate__ exploitation via BUILD"
+                            if is_build_setstate
+                            else "Detected dangerous __reduce__ pattern"
+                        ),
                         severity=severity,
-                        rule_code=rule_code,
+                        rule_code=dangerous_pattern_rule_code,
                         location=location,
                         details=details,
-                        why="A dangerous pattern was detected that could execute arbitrary code during unpickling.",
+                        why=(
+                            "BUILD can invoke __setstate__ on attacker-controlled state."
+                            if is_build_setstate
+                            else "A dangerous pattern was detected that could execute arbitrary code during unpickling."
+                        ),
                     )
             else:
                 # Record successful validation - no dangerous reduce patterns found

@@ -108,6 +108,7 @@ PROTO0_1_TRIVIAL_LEADING_OPCODES: frozenset[str] = frozenset(
         "SHORT_BINUNICODE",
     },
 )
+SAFETENSORS_MAX_HEADER_BYTES: int = 100 * 1024 * 1024
 
 
 def _looks_like_proto0_or_1_pickle(sample: bytes) -> bool:
@@ -156,6 +157,44 @@ def _read_pickle_probe_sample(path: Path, size: int, header16: bytes) -> bytes:
         return header16
     with path.open("rb") as f:
         return f.read(min(size, PROTO0_1_MAX_PROBE_BYTES))
+
+
+def _looks_like_safetensors_structure(path: Path | None, magic8: bytes, file_size: int) -> bool:
+    """Validate safetensors framing: <u64 header_len><JSON header><tensor data>."""
+    if file_size <= 8 or len(magic8) < 8:
+        return False
+
+    try:
+        header_len = struct.unpack("<Q", magic8)[0]
+    except struct.error:
+        return False
+
+    if header_len <= 0:
+        return False
+    if header_len >= SAFETENSORS_MAX_HEADER_BYTES:
+        return False
+    if header_len > file_size - 8:
+        return False
+
+    if path is None:
+        return False
+
+    try:
+        with path.open("rb") as handle:
+            handle.seek(8)
+            header = handle.read(header_len)
+    except OSError:
+        return False
+
+    if len(header) != header_len or not header.startswith(b"{"):
+        return False
+
+    try:
+        parsed_header = json.loads(header.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+
+    return isinstance(parsed_header, dict)
 
 
 def _normalize_archive_member_name(member_name: str) -> str:
@@ -426,7 +465,9 @@ def _detect_compression_format(prefix: bytes) -> str | None:
     return None
 
 
-def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes) -> FileFormat:
+def detect_format_from_magic_bytes(
+    magic4: MagicBytes, magic8: MagicBytes, magic16: MagicBytes, file_size: int, file_path: Path | None = None
+) -> FileFormat:
     """Detect file format using Python 3.10+ pattern matching on magic bytes."""
     compression_format = _detect_compression_format(magic16)
     if compression_format:
@@ -475,17 +516,13 @@ def detect_format_from_magic_bytes(magic4: MagicBytes, magic8: MagicBytes, magic
             return "pickle"
         case _:
             pass
-    # Check for JSON-like formats (SafeTensors, etc.)
-    match magic4[0:1]:
-        case b"{":
-            return "safetensors"
-        case _:
-            pass
+    if _looks_like_safetensors_structure(file_path, magic8, file_size):
+        return "safetensors"
 
     # Check for patterns in first 16 bytes
     if b"onnx" in magic16:
         return "onnx"
-    if b'"__metadata__"' in magic16:
+    if b'"__metadata__"' in magic16 and _looks_like_safetensors_structure(file_path, magic8, file_size):
         return "safetensors"
 
     return "unknown"
@@ -529,7 +566,7 @@ def detect_file_format_from_magic(path: str) -> str:
                 return "executorch"
 
             # Try the new pattern matching approach first
-            format_result = detect_format_from_magic_bytes(magic4, magic8, magic16)
+            format_result = detect_format_from_magic_bytes(magic4, magic8, magic16, size, file_path)
             if format_result == "zip" and file_path.suffix.lower() == ".mar" and is_torchserve_mar_archive(path):
                 return "torchserve_mar"
             if format_result != "unknown":
@@ -567,28 +604,15 @@ def detect_file_format_from_magic(path: str) -> str:
                 if b"<PMML" in xml_header:
                     return "pmml"
 
-            # SafeTensors format check: 8-byte length header + JSON metadata
-            if size >= 12:  # Minimum: 8 bytes length + some JSON
-                try:
-                    json_length = struct.unpack("<Q", magic8)[0]
-                    # Sanity check: JSON length should be reasonable
-                    if 0 < json_length < size and json_length < 1024 * 1024:  # Max 1MB JSON
-                        f.seek(8)
-                        json_start = f.read(min(32, json_length))
-                        if json_start.startswith(b"{") and b'"' in json_start:
-                            return "safetensors"
-                except (struct.error, OSError):
-                    pass
-
     except OSError:
         return "unknown"
 
-    # Fallback: check if it starts with JSON (for old safetensors or other JSON formats)
+    # Fallback: use strict safetensors framing; plain JSON must not be routed as safetensors.
     magic4 = header[:4]
     magic8 = header[:8]
     magic16 = header[:16]
 
-    if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
+    if _looks_like_safetensors_structure(file_path, magic8, size):
         return "safetensors"
 
     if magic4 == b"\x08\x01\x12\x00" or b"onnx" in magic16:
@@ -700,8 +724,8 @@ def detect_file_format(path: str) -> str:
         # followed by a properly formed GLOBAL opcode sequence.
         if MARKED_PROTOCOL0_GLOBAL_RE.match(magic64):
             return "pickle"
-        # Check for safetensors format (starts with JSON header)
-        if magic4[0:1] == b"{" or (size > 8 and b'"__metadata__"' in magic16):
+        # Check for safetensors format (<u64 header_len> + JSON header).
+        if _looks_like_safetensors_structure(file_path, magic8, size):
             return "safetensors"
 
         # Check for ONNX format (protobuf)
@@ -807,6 +831,8 @@ def detect_file_format(path: str) -> str:
         ".txz",
     ):
         return "tar"
+    if _looks_like_safetensors_structure(file_path, magic8, size):
+        return "safetensors"
     return "unknown"
 
 

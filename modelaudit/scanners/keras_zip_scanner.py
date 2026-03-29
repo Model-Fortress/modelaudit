@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import zipfile
+from pathlib import Path
 from typing import Any, ClassVar
 
 from modelaudit.detectors.suspicious_symbols import (
@@ -198,18 +199,12 @@ class KerasZipScanner(BaseScanner):
         if not os.path.isfile(path):
             return False
 
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in cls.supported_extensions:
-            return False
-
         # Check if it's a ZIP file
         try:
-            with zipfile.ZipFile(path, "r") as zf:
-                # Check if it contains the expected Keras ZIP structure
-                namelist = zf.namelist()
-                # New Keras format should have config.json
-                return "config.json" in namelist
-        except (zipfile.BadZipFile, Exception):
+            from ..utils.file.detection import is_keras_zip_archive
+
+            return is_keras_zip_archive(path, allow_config_only=Path(path).suffix.lower() == ".keras")
+        except Exception:
             return False
 
     def scan(self, path: str) -> ScanResult:

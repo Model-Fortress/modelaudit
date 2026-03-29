@@ -120,8 +120,6 @@ class TorchServeMarScanner(BaseScanner):
     def can_handle(cls, path: str) -> bool:
         if not os.path.isfile(path):
             return False
-        if os.path.splitext(path)[1].lower() not in cls.supported_extensions:
-            return False
 
         try:
             from ..utils.file.detection import is_torchserve_mar_archive
@@ -1347,8 +1345,11 @@ class TorchServeMarScanner(BaseScanner):
             if char == '"' and not in_single_quote:
                 in_double_quote = not in_double_quote
                 continue
-            if char == "#" and not in_single_quote and not in_double_quote and (
-                index == 0 or line[index - 1].isspace()
+            if (
+                char == "#"
+                and not in_single_quote
+                and not in_double_quote
+                and (index == 0 or line[index - 1].isspace())
             ):
                 return line[:index].strip()
 

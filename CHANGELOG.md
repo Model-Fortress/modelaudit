@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- route misnamed ZIP, HDF5, and 7z files through content-aware scanner selection
 - preserve disguised model files during directory prefiltering without promoting document ZIPs
 - recurse into nested 7z members even when their filenames use misleading extensions
 - fail closed on extreme-size files when a scanner lacks bounded large-file analysis

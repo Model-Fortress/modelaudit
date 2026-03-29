@@ -218,6 +218,8 @@ def _select_preferred_scanner_id(path: str, header_format: str, ext: str) -> str
             return "pytorch_zip"
         if is_executorch_archive(path):
             return "executorch"
+        if ext == ".skops":
+            return "skops"
 
         if ext == ".bin":
             # ZIP-backed torch.save() .bin files are routed through the pickle scanner,

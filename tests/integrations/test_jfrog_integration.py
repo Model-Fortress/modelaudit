@@ -1,5 +1,5 @@
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -175,6 +175,30 @@ def test_scan_jfrog_folder_success(mock_scan, mock_download_folder, mock_detect,
     assert metadata["jfrog_source"]["type"] == "folder"
     assert metadata["jfrog_source"]["url"] == "https://company.jfrog.io/artifactory/repo/models/"
     assert metadata["jfrog_source"]["repo"] == "test-repo"
+
+
+@patch("modelaudit.integrations.jfrog.shutil.rmtree")
+@patch("modelaudit.integrations.jfrog.tempfile.mkdtemp")
+@patch("modelaudit.integrations.jfrog.detect_jfrog_target_type")
+@patch("modelaudit.integrations.jfrog.download_jfrog_folder")
+@patch("modelaudit.core.scan_model_directory_or_file")
+def test_scan_jfrog_folder_download_error_aborts_scan(
+    mock_scan: MagicMock,
+    mock_download_folder: MagicMock,
+    mock_detect: MagicMock,
+    mock_mkdtemp: MagicMock,
+    mock_rmtree: MagicMock,
+) -> None:
+    """Test that folder download failures stop before scanning."""
+    temp_dir = "/tmp/modelaudit_jfrog_test"
+    mock_mkdtemp.return_value = temp_dir
+    mock_detect.return_value = {"type": "folder", "repo": "test-repo", "path": "/models"}
+    mock_download_folder.side_effect = Exception("JFrog folder download failed after 1 of 2 file(s) completed")
+
+    with pytest.raises(Exception, match="JFrog folder download failed"):
+        scan_jfrog_artifact("https://company.jfrog.io/artifactory/repo/models/")
+
+    mock_scan.assert_not_called()
 
 
 @patch("modelaudit.integrations.jfrog.shutil.rmtree")

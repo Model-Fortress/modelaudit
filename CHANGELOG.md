@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **security:** scan TensorFlow SavedModel `assets/` and `assets.extra/` directories for executable-like content (shebang scripts, ELF/Mach-O binaries, pickle magic, and embedded Python source patterns)
 - **security:** enforce SafeTensors `MAX_HEADER_BYTES` during `scan()` and skip regex-heavy metadata-content analysis when headers exceed the configured limit to reduce header-based DoS risk
 - emit a one-time warning when the HuggingFace whitelist snapshot is older than 90 days while preserving existing whitelist severity downgrades
+- treat pickle scan timeouts as unsuccessful while preserving post-budget tail scans after opcode truncation
 - harden pickle CVE-2026-24747 SETITEM detection against stack-neutral padding
 - **keras:** harden CVE-2025-9906 detection against documentation-padding bypasses in `.keras` `config.json`
 - count successful `stream://` scans in `files_scanned` so clean streaming scans return exit code 0 instead of 2

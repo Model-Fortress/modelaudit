@@ -4152,11 +4152,11 @@ class PickleScanner(BaseScanner):
                 result.merge(scan_result)
 
                 # For .bin files, also scan the remaining binary content
-                # PyTorch files have pickle header followed by tensor data
-                if is_bin_file and scan_result.success:
-                    # Use the first pickle stream end position (before multi-stream
-                    # scanning consumed additional bytes) for binary content scanning.
-                    pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos", f.tell())
+                # PyTorch files have pickle header followed by tensor data. Keep
+                # scanning the tail when the first pickle stream completed even if
+                # opcode-budget or timeout limits marked the opcode scan unsuccessful.
+                pickle_end_pos = scan_result.metadata.get("first_pickle_end_pos")
+                if is_bin_file and isinstance(pickle_end_pos, int):
                     remaining_bytes = file_size - pickle_end_pos
 
                     if remaining_bytes > 0:
@@ -4460,7 +4460,7 @@ class PickleScanner(BaseScanner):
             and check.severity == IssueSeverity.CRITICAL
             for check in result.checks
         )
-        result.finish(success=result.success and not has_critical_post_budget_failure)
+        result.finish(success=scan_result.success and not has_critical_post_budget_failure)
         return result
 
     def _scan_for_dangerous_patterns(self, data: bytes, result: ScanResult, context_path: str) -> None:
@@ -5271,6 +5271,7 @@ class PickleScanner(BaseScanner):
 
         current_pos = file_obj.tell()
         timeout_exceeded = False
+        timed_out = False
 
         # Read file data - either all at once for small files or first chunk for large files.
         # For large files, read only the first 10MB for in-memory string/pattern analysis to cap
@@ -5455,14 +5456,14 @@ class PickleScanner(BaseScanner):
             sys.setrecursionlimit(new_limit)
             # Process the pickle
             start_pos = file_obj.tell()
-            # Tiered stack depth limits for better false positive handling
-            # Legitimate large ML models often have stack depths of 1000-3000
             base_stack_depth_limit = 3000
             warning_stack_depth_limit = 5000
+            scan_start_time = self.scan_start_time if self.scan_start_time is not None else result.start_time
+            deadline = scan_start_time + self.timeout
             analysis = self._build_pickle_opcode_analysis(
                 file_obj,
                 multiple_pickles=True,
-                scan_start_time=result.start_time,
+                scan_start_time=scan_start_time,
                 include_sequence_analysis=True,
                 include_stack_metrics=True,
                 probe_for_budget_exceeded=True,
@@ -5502,12 +5503,14 @@ class PickleScanner(BaseScanner):
                     file_obj.seek(start_pos)
                     advanced_globals = self._extract_globals_advanced(
                         file_obj,
-                        scan_start_time=result.start_time,
+                        scan_start_time=scan_start_time,
                     )
                     file_obj.seek(start_pos)
                 raise analysis.error
 
-            if opcode_budget_exceeded or timeout_exceeded:
+            timed_out = timeout_exceeded or time.time() > deadline
+
+            if opcode_budget_exceeded or timed_out:
                 result.metadata["analysis_incomplete"] = True
 
             if opcode_budget_exceeded:
@@ -5526,7 +5529,7 @@ class PickleScanner(BaseScanner):
                     rule_code="S902",
                 )
 
-            if (timeout_exceeded or time.time() - result.start_time > self.timeout) and not any(
+            if timed_out and not any(
                 check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED for check in result.checks
             ):
                 result.add_check(
@@ -5568,8 +5571,8 @@ class PickleScanner(BaseScanner):
             max_analyzed_offset = analysis.max_analyzed_offset
             post_budget_minimum_offset = max(max_analyzed_end_offset, max_analyzed_offset + 1, 0)
 
-            should_run_post_budget_scan = opcode_budget_exceeded and not timeout_exceeded
-            if timeout_exceeded:
+            should_run_post_budget_scan = opcode_budget_exceeded and not timed_out
+            if timed_out:
                 result.metadata["post_budget_global_scan_skipped_due_to_timeout"] = True
 
             if should_run_post_budget_scan:
@@ -5634,7 +5637,7 @@ class PickleScanner(BaseScanner):
                     file_obj,
                     file_size=file_size,
                     minimum_offset=post_budget_minimum_offset,
-                    deadline=result.start_time + self.timeout,
+                    deadline=deadline,
                 )
                 if post_budget_expansion_findings:
                     suspicious_count += len(post_budget_expansion_findings)
@@ -7223,6 +7226,7 @@ class PickleScanner(BaseScanner):
             with contextlib.suppress(NameError):
                 sys.setrecursionlimit(original_recursion_limit)  # type: ignore[possibly-unresolved-reference]
 
+        result.finish(success=not timed_out)
         return result
 
     def _is_legitimate_pytorch_model(self, path: str) -> bool:

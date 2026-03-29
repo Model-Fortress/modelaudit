@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- avoid materializing streaming directory iterators in memory
 - fail closed when JFrog folder downloads return only partial results
 - **keras:** anchor safe Lambda normalization regexes in H5 scanning so appended statements (for example `; __import__(...)`) cannot bypass dangerous-code analysis
 - complete primary header-format routing in `core.py` so all registered model formats map to scanner IDs (including OpenVINO/PMML/CNTK/LightGBM/Torch7/CatBoost/RKNN/MXNet/NeMo/Llamafile/TFLite/CoreML/Paddle/TensorRT/Flax/R/ExecuTorch/7z/compressed/skops/joblib/xgboost/jax_checkpoint), add `.skops` extension detection coverage without spurious ZIP mismatch noise, and route ZIP-backed PyTorch `.ckpt`/`.pkl` containers through the PyTorch ZIP path

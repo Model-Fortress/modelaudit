@@ -2405,6 +2405,166 @@ class TestPickleScannerBlocklistHardening(unittest.TestCase):
             f"Expected CRITICAL joblib.load issue, got: {critical_messages}"
         )
 
+    def test_pickle_unpickler_reduce_is_critical(self) -> None:
+        """_pickle.Unpickler must never be treated as a safe global."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("_pickle", "Unpickler"))
+
+        assert result.success
+        assert result.has_errors
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("_pickle.unpickler" in msg for msg in critical_messages), (
+            f"Expected CRITICAL _pickle.Unpickler issue, got: {critical_messages}"
+        )
+
+    def test_pickle_pickler_reduce_is_critical(self) -> None:
+        """_pickle.Pickler must never be treated as a safe global."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("_pickle", "Pickler"))
+
+        assert result.success
+        assert result.has_errors
+        critical_messages = [i.message.lower() for i in result.issues if i.severity == IssueSeverity.CRITICAL]
+        assert any("_pickle.pickler" in msg for msg in critical_messages), (
+            f"Expected CRITICAL _pickle.Pickler issue, got: {critical_messages}"
+        )
+
+    def test_copyreg_add_extension_import_only_is_flagged(self) -> None:
+        """copyreg.add_extension import references must be treated as suspicious."""
+        result = self._scan_bytes(self._craft_global_import_only_pickle("copyreg", "add_extension"))
+
+        assert result.success
+        assert result.has_errors
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        matching_checks = [check for check in failed_checks if "copyreg.add_extension" in check.message.lower()]
+        assert matching_checks, (
+            f"Expected suspicious copyreg.add_extension finding, got: {[check.message for check in failed_checks]}"
+        )
+        assert any(check.severity == IssueSeverity.CRITICAL for check in matching_checks), (
+            f"Expected CRITICAL copyreg.add_extension finding, got: "
+            f"{[(check.severity, check.message) for check in matching_checks]}"
+        )
+        assert not any(check.severity == IssueSeverity.WARNING for check in matching_checks), (
+            "Did not expect WARNING copyreg.add_extension finding, "
+            f"got: {[(check.severity, check.message) for check in matching_checks]}"
+        )
+
+    def test_copyreg_remove_extension_import_only_is_flagged(self) -> None:
+        """copyreg.remove_extension import references must be treated as suspicious."""
+        result = self._scan_bytes(self._craft_global_import_only_pickle("copyreg", "remove_extension"))
+
+        assert result.success
+        assert result.has_errors
+        failed_checks = [check for check in result.checks if check.status == CheckStatus.FAILED]
+        matching_checks = [check for check in failed_checks if "copyreg.remove_extension" in check.message.lower()]
+        assert matching_checks, (
+            f"Expected suspicious copyreg.remove_extension finding, got: {[check.message for check in failed_checks]}"
+        )
+        assert any(check.severity == IssueSeverity.CRITICAL for check in matching_checks), (
+            f"Expected CRITICAL copyreg.remove_extension finding, got: "
+            f"{[(check.severity, check.message) for check in matching_checks]}"
+        )
+        assert not any(check.severity == IssueSeverity.WARNING for check in matching_checks), (
+            "Did not expect WARNING copyreg.remove_extension finding, "
+            f"got: {[(check.severity, check.message) for check in matching_checks]}"
+        )
+
+    def _assert_reduce_target_severity(self, function_name: str, expected_severity: IssueSeverity) -> None:
+        """Assert the executed-call findings for a functools REDUCE target use the expected severity."""
+        result = self._scan_bytes(self._craft_global_reduce_pickle("functools", function_name))
+
+        assert result.success
+        if expected_severity == IssueSeverity.CRITICAL:
+            assert result.has_errors
+        else:
+            assert not result.has_errors
+
+        target = f"functools.{function_name}"
+        reduce_checks = [
+            check
+            for check in result.checks
+            if check.name == "REDUCE Opcode Safety Check"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("associated_global") == target
+        ]
+        assert reduce_checks, [check.message for check in result.checks]
+        assert all(check.severity == expected_severity for check in reduce_checks), (
+            f"Unexpected REDUCE severities for {target}: {[(check.severity, check.message) for check in reduce_checks]}"
+        )
+
+        reduce_pattern_checks = [
+            check
+            for check in result.checks
+            if check.name == "Reduce Pattern Analysis"
+            and check.status == CheckStatus.FAILED
+            and check.details.get("module") == "functools"
+            and check.details.get("function") == function_name
+        ]
+        assert reduce_pattern_checks, [check.message for check in result.checks]
+        assert all(check.severity == expected_severity for check in reduce_pattern_checks), (
+            f"Unexpected reduce-pattern severities for {target}: "
+            f"{[(check.severity, check.message) for check in reduce_pattern_checks]}"
+        )
+
+    def test_functools_reduce_remains_critical(self) -> None:
+        """functools.reduce must remain CRITICAL even while partial stays WARNING."""
+        self._assert_reduce_target_severity("reduce", IssueSeverity.CRITICAL)
+
+    def test_functools_partial_remains_warning(self) -> None:
+        """functools.partial should still be downgraded to WARNING."""
+        self._assert_reduce_target_severity("partial", IssueSeverity.WARNING)
+
+    def test_functools_partialmethod_remains_warning(self) -> None:
+        """functools.partialmethod should inherit the same WARNING downgrade as partial."""
+        self._assert_reduce_target_severity("partialmethod", IssueSeverity.WARNING)
+
+    def _assert_ext_resolved_functools_ref_is_critical(self, target_name: str) -> None:
+        """EXT-origin functools refs must remain CRITICAL despite warning downgrades for direct refs."""
+        import copyreg
+        from contextlib import suppress
+
+        inverted_registry = getattr(copyreg, "_inverted_registry", {})
+        extension_registry = getattr(copyreg, "_extension_registry", {})
+        existing_code = extension_registry.get(("functools", target_name))
+        ext_code = next((candidate for candidate in range(1, 256) if candidate not in inverted_registry), None)
+        if ext_code is None:
+            pytest.skip("No free copyreg extension code available in range 1-255")
+
+        try:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.remove_extension("functools", target_name, existing_code)
+
+            copyreg.add_extension("functools", target_name, ext_code)
+            try:
+                result = self._scan_bytes(b"\x80\x02\x82" + bytes([ext_code]) + b")R.")
+
+                assert result.success
+                assert result.has_errors
+                target_issues = [
+                    issue for issue in result.issues if f"functools.{target_name}" in issue.message.lower()
+                ]
+                assert target_issues, (
+                    f"Expected functools.{target_name} findings, got: {[issue.message for issue in result.issues]}"
+                )
+                assert all(issue.severity == IssueSeverity.CRITICAL for issue in target_issues), (
+                    f"Expected CRITICAL functools.{target_name} findings, got: "
+                    f"{[(issue.severity, issue.message) for issue in target_issues]}"
+                )
+            finally:
+                with suppress(ValueError):
+                    copyreg.remove_extension("functools", target_name, ext_code)
+        finally:
+            if isinstance(existing_code, int):
+                with suppress(ValueError):
+                    copyreg.add_extension("functools", target_name, existing_code)
+
+    def test_ext_resolved_functools_partial_remains_critical(self) -> None:
+        """EXT-origin functools.partial must remain CRITICAL."""
+        self._assert_ext_resolved_functools_ref_is_critical("partial")
+
+    def test_ext_resolved_functools_partialmethod_remains_critical(self) -> None:
+        """EXT-origin functools.partialmethod must remain CRITICAL."""
+        self._assert_ext_resolved_functools_ref_is_critical("partialmethod")
+
     # ------------------------------------------------------------------
     # Fix 4: NEWOBJ_EX with dangerous class
     # ------------------------------------------------------------------

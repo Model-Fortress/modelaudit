@@ -755,13 +755,14 @@ ALWAYS_DANGEROUS_MODULES: set[str] = {
 # Modules that are suspicious but should only be flagged at WARNING severity.
 # These modules appear frequently in legitimate ML pipelines and cannot directly
 # execute arbitrary code, so CRITICAL would cause too many false positives.
-WARNING_SEVERITY_MODULES: set[str] = {
-    # functools.partial is heavily used in PyTorch models; functools.reduce is
-    # the only genuinely dangerous entry and is still in SUSPICIOUS_GLOBALS.
-    "functools",
+WARNING_SEVERITY_MODULES: dict[str, set[str] | None] = {
+    # functools.partial/partialmethod are heavily used in PyTorch models and
+    # should remain WARNING-level noise reducers. functools.reduce is excluded
+    # so reduce-driven execution chains stay CRITICAL.
+    "functools": {"partial", "partialmethod"},
     # glob.glob / glob.iglob are common in dataset loading pipelines and
     # cannot directly execute code.
-    "glob",
+    "glob": None,
 }
 
 # Risky ML-specific import surfaces that must be flagged even when they appear
@@ -954,10 +955,6 @@ ML_SAFE_GLOBALS: dict[str, list[str]] = {
         "_rebuild_device_tensor_from_numpy",
         "_rebuild_qtensor",
         "_rebuild_sparse_tensor",
-    ],
-    "_pickle": [
-        "Unpickler",
-        "Pickler",
     ],
     # Python builtins - safe built-in types and functions
     # NOTE: eval, exec, compile, __import__, open, file are NOT in this list (they remain dangerous)
@@ -2073,6 +2070,30 @@ def _normalize_import_reference(mod: str, func: str) -> tuple[str, str]:
     return mod.strip().lower(), func.strip().lower()
 
 
+def _is_warning_severity_ref(normalized_mod: str, normalized_func: str) -> bool:
+    """Return True when a dangerous ref should be downgraded to WARNING severity."""
+    if normalized_mod not in WARNING_SEVERITY_MODULES:
+        return False
+    warning_funcs = WARNING_SEVERITY_MODULES[normalized_mod]
+    if warning_funcs is None:
+        return True
+    return normalized_func in warning_funcs
+
+
+def _dangerous_ref_base_severity(
+    normalized_mod: str,
+    normalized_func: str,
+    *,
+    origin_is_ext: bool = False,
+) -> IssueSeverity:
+    """Return the base severity for a resolved dangerous import reference."""
+    if origin_is_ext or _is_copyreg_extension_ref(normalized_mod):
+        return IssueSeverity.CRITICAL
+    return (
+        IssueSeverity.WARNING if _is_warning_severity_ref(normalized_mod, normalized_func) else IssueSeverity.CRITICAL
+    )
+
+
 def _is_resolved_import_target(mod: str, func: str) -> bool:
     """Return True when module/function look like concrete Python import targets."""
     if not mod or not func:
@@ -2103,11 +2124,11 @@ def _classify_import_reference(
 
     normalized_mod, normalized_func = _normalize_import_reference(mod, func)
     if is_import_only and (normalized_mod, normalized_func) in IMPORT_ONLY_ALWAYS_DANGEROUS_GLOBALS:
-        base_sev = IssueSeverity.WARNING if normalized_mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+        base_sev = _dangerous_ref_base_severity(normalized_mod, normalized_func)
         return True, base_sev, "dangerous"
 
     if _is_actually_dangerous_global(mod, func, ml_context):
-        base_sev = IssueSeverity.WARNING if normalized_mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+        base_sev = _dangerous_ref_base_severity(normalized_mod, normalized_func)
         return True, base_sev, "dangerous"
 
     if _is_safe_ml_global(mod, func):
@@ -3195,13 +3216,15 @@ def is_dangerous_reduce_pattern(
             reduce_ref = resolved_callables.get(i)
             if reduce_ref:
                 mod, func = reduce_ref
-                if _is_dangerous_ref(mod, func, origin_is_ext=resolved_callable_origin_is_ext.get(i, False)):
+                origin_is_ext = resolved_callable_origin_is_ext.get(i, False)
+                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext):
                     return {
                         "pattern": "RESOLVED_REDUCE_CALL_TARGET",
                         "module": mod,
                         "function": func,
                         "position": pos,
                         "opcode": opcode.name,
+                        "origin_is_ext": origin_is_ext,
                     }
 
         # Check for GLOBAL followed by REDUCE - common in exploits
@@ -3278,12 +3301,14 @@ def is_dangerous_reduce_pattern(
             ref = resolved_callables.get(i)
             if ref:
                 mod, func = ref
-                if _is_dangerous_ref(mod, func, origin_is_ext=resolved_callable_origin_is_ext.get(i, False)):
+                origin_is_ext = resolved_callable_origin_is_ext.get(i, False)
+                if _is_dangerous_ref(mod, func, origin_is_ext=origin_is_ext):
                     return {
                         "pattern": f"{opcode.name}_EXECUTION",
                         "argument": f"{mod}.{func}",
                         "position": pos,
                         "opcode": opcode.name,
+                        "origin_is_ext": origin_is_ext,
                     }
 
         # Check for suspicious attribute access patterns (GETATTR followed by CALL)
@@ -5345,7 +5370,8 @@ class PickleScanner(BaseScanner):
             for mod, func, opcode_name in advanced_globals:
                 if _is_actually_dangerous_global(mod, func, ml_context):
                     suspicious_count += 1
-                    base_sev = IssueSeverity.WARNING if mod in WARNING_SEVERITY_MODULES else IssueSeverity.CRITICAL
+                    normalized_mod, normalized_func = _normalize_import_reference(mod, func)
+                    base_sev = _dangerous_ref_base_severity(normalized_mod, normalized_func)
                     severity = _get_context_aware_severity(
                         base_sev,
                         ml_context,
@@ -5500,13 +5526,23 @@ class PickleScanner(BaseScanner):
                             # NOT in safe globals - check if it's actually dangerous
                             # Use _is_actually_dangerous_global to determine severity (CRITICAL vs WARNING)
                             if reduce_mod and reduce_func:
+                                normalized_reduce_mod, normalized_reduce_func = _normalize_import_reference(
+                                    reduce_mod,
+                                    reduce_func,
+                                )
+                                dangerous_base_severity = _dangerous_ref_base_severity(
+                                    normalized_reduce_mod,
+                                    normalized_reduce_func,
+                                    origin_is_ext=reduce_origin_is_ext,
+                                )
                                 is_actually_dangerous = reduce_origin_is_ext or _is_actually_dangerous_global(
                                     reduce_mod, reduce_func, ml_context
                                 )
                                 if is_actually_dangerous:
-                                    # Dangerous global (e.g., os.system) - CRITICAL
+                                    # Dangerous global (e.g., os.system) - CRITICAL unless
+                                    # the dangerous ref is explicitly configured as WARNING.
                                     severity = _get_context_aware_severity(
-                                        IssueSeverity.CRITICAL,
+                                        dangerous_base_severity,
                                         ml_context,
                                         issue_type="dangerous_global",
                                     )
@@ -5660,13 +5696,23 @@ class PickleScanner(BaseScanner):
                         else:
                             # NOT in safe classes - check if actually dangerous
                             if class_mod and class_name:
+                                normalized_class_mod, normalized_class_name = _normalize_import_reference(
+                                    class_mod,
+                                    class_name,
+                                )
+                                dangerous_base_severity = _dangerous_ref_base_severity(
+                                    normalized_class_mod,
+                                    normalized_class_name,
+                                    origin_is_ext=class_origin_is_ext,
+                                )
                                 is_actually_dangerous = class_origin_is_ext or _is_actually_dangerous_global(
                                     class_mod, class_name, ml_context
                                 )
                                 if is_actually_dangerous:
-                                    # Dangerous class (e.g., os.system wrapper) - CRITICAL
+                                    # Dangerous class (e.g., os.system wrapper) - CRITICAL unless
+                                    # the dangerous ref is explicitly configured as WARNING.
                                     severity = _get_context_aware_severity(
-                                        IssueSeverity.CRITICAL,
+                                        dangerous_base_severity,
                                         ml_context,
                                         issue_type="dangerous_global",
                                     )
@@ -6094,8 +6140,21 @@ class PickleScanner(BaseScanner):
             )
             if dangerous_pattern:
                 suspicious_count += 1
+                normalized_pattern_mod, normalized_pattern_func = _normalize_import_reference(
+                    dangerous_pattern.get("module", ""),
+                    dangerous_pattern.get("function", ""),
+                )
+                dangerous_pattern_base_severity = (
+                    _dangerous_ref_base_severity(
+                        normalized_pattern_mod,
+                        normalized_pattern_func,
+                        origin_is_ext=bool(dangerous_pattern.get("origin_is_ext")),
+                    )
+                    if normalized_pattern_mod and normalized_pattern_func
+                    else IssueSeverity.CRITICAL
+                )
                 severity = _get_context_aware_severity(
-                    IssueSeverity.CRITICAL,
+                    dangerous_pattern_base_severity,
                     ml_context,
                     issue_type="dangerous_import",
                 )

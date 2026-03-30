@@ -35,7 +35,7 @@ from ..config.explanations import (
 )
 from ..detectors.cve_patterns import analyze_cve_patterns, enhance_scan_result_with_cve
 from ..detectors.suspicious_symbols import DANGEROUS_OPCODES
-from .base import BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
+from .base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, CheckStatus, IssueSeverity, ScanResult, logger
 from .rule_mapper import (
     get_embedded_code_rule_code,
     get_encoding_rule_code,
@@ -110,6 +110,39 @@ class _NestedPickleMatch:
     offset: int
     sample_size: int
     searched_bytes: int
+
+
+def _mark_inconclusive_scan_result(result: ScanResult, reason: str) -> None:
+    """Mark a scan result as inconclusive when analysis could not complete."""
+    existing_reasons = result.metadata.get("scan_outcome_reasons")
+    reasons = existing_reasons if isinstance(existing_reasons, list) else []
+
+    if reason not in reasons:
+        reasons.append(reason)
+
+    result.metadata["scan_outcome"] = INCONCLUSIVE_SCAN_OUTCOME
+    result.metadata["scan_outcome_reasons"] = reasons
+    result.metadata["analysis_incomplete"] = True
+
+
+def _scan_result_has_security_findings(result: ScanResult) -> bool:
+    """Return True when the result includes WARNING/CRITICAL findings."""
+    return any(issue.severity in {IssueSeverity.WARNING, IssueSeverity.CRITICAL} for issue in result.issues)
+
+
+def _finish_with_inconclusive_contract(
+    result: ScanResult,
+    *,
+    default_success: bool,
+    allow_security_findings_override: bool = False,
+) -> None:
+    """Finalize success so inconclusive/no-finding scans fail closed."""
+    has_security_findings = _scan_result_has_security_findings(result)
+    if result.metadata.get("scan_outcome") == INCONCLUSIVE_SCAN_OUTCOME and not has_security_findings:
+        result.finish(success=False)
+        return
+
+    result.finish(success=default_success or (allow_security_findings_override and has_security_findings))
 
 
 def _format_stack_global_string_preview(value: str) -> str:
@@ -4495,6 +4528,21 @@ class PickleScanner(BaseScanner):
                 self.current_file_path = path
                 scan_result = self._scan_pickle_bytes(f, file_size)
                 result.merge(scan_result)
+                if (
+                    not scan_result.success
+                    and result.metadata.get("scan_outcome") != INCONCLUSIVE_SCAN_OUTCOME
+                    and not result.metadata.get("operational_error")
+                    and not _scan_result_has_security_findings(result)
+                ):
+                    fallback_reason = (
+                        "scan_timeout"
+                        if any(
+                            check.name == "Scan Timeout Check" and check.status == CheckStatus.FAILED
+                            for check in result.checks
+                        )
+                        else "incomplete_analysis"
+                    )
+                    _mark_inconclusive_scan_result(result, fallback_reason)
 
                 # For .bin files, also scan the remaining binary content
                 # PyTorch files have pickle header followed by tensor data. Keep
@@ -4526,9 +4574,7 @@ class PickleScanner(BaseScanner):
         except Exception as e:
             # Check if we already found security issues in the early pattern detection
             # If so, we should preserve those findings even if we hit recursion errors
-            has_security_findings = any(
-                issue.severity in [IssueSeverity.CRITICAL, IssueSeverity.WARNING] for issue in result.issues
-            )
+            has_security_findings = _scan_result_has_security_findings(result)
 
             # Check for recursion errors on legitimate ML model files
             file_ext = os.path.splitext(path)[1].lower()
@@ -4564,6 +4610,7 @@ class PickleScanner(BaseScanner):
                         "binary_bytes": max(file_size - _compute_pickle_length(path), 0),
                     }
                 )
+                _mark_inconclusive_scan_result(result, "recursion_limit_exceeded")
                 # Add a note about the recursion limit but don't treat it as the main issue
                 result.add_check(
                     name="Recursion Depth Check",
@@ -4576,13 +4623,14 @@ class PickleScanner(BaseScanner):
                         "file_size": file_size,
                         "exception_type": "RecursionError",
                         "security_issues_count": len([i for i in result.issues if i.severity != IssueSeverity.INFO]),
+                        "analysis_incomplete": True,
                     },
                     why=(
                         "The scan encountered recursion limits but already detected security issues in the file. "
                         "The identified security issues are valid findings that should be addressed."
                     ),
                 )
-                result.finish(success=True)
+                _finish_with_inconclusive_contract(result, default_success=True)
                 return result
             if is_recursion_on_legitimate_model:
                 # Recursion error on legitimate ML model - treat as scanner limitation, not security issue
@@ -4595,6 +4643,7 @@ class PickleScanner(BaseScanner):
                         "scanner_limitation": True,
                     }
                 )
+                _mark_inconclusive_scan_result(result, "recursion_limit_exceeded")
                 # Add as info-level check for transparency, not critical
                 result.add_check(
                     name="Recursion Depth Check",
@@ -4605,6 +4654,8 @@ class PickleScanner(BaseScanner):
                         "reason": "recursion_limit_on_legitimate_model",
                         "file_size": file_size,
                         "file_format": file_ext,
+                        "scanner_limitation": True,
+                        "analysis_incomplete": True,
                     },
                     why=(
                         "This model file contains complex nested structures that exceed the scanner's "
@@ -4614,7 +4665,7 @@ class PickleScanner(BaseScanner):
                     ),
                     rule_code=None,  # Passing check
                 )
-                result.finish(success=True)  # Mark as successful scan despite limitation
+                _finish_with_inconclusive_contract(result, default_success=True)
                 return result
             if is_recursion_error:
                 # Flag extremely small files with malicious patterns
@@ -4638,6 +4689,7 @@ class PickleScanner(BaseScanner):
                             "exception_type": "RecursionError",
                             "early_detection_successful": early_pattern_scan_completed,
                             "suspicious_filename": is_malicious_name,
+                            "analysis_incomplete": True,
                         },
                         why=(
                             "This very small file has a suspicious filename and caused recursion errors "
@@ -4662,6 +4714,8 @@ class PickleScanner(BaseScanner):
                             "file_size": file_size,
                             "exception_type": "RecursionError",
                             "early_detection_successful": early_pattern_scan_completed,
+                            "scanner_limitation": True,
+                            "analysis_incomplete": True,
                         },
                         why=(
                             "The pickle file structure is too complex for the scanner to fully analyze due to "
@@ -4678,7 +4732,8 @@ class PickleScanner(BaseScanner):
                         "scanner_limitation": True,
                     }
                 )
-                result.finish(success=True)  # Mark as successful scan despite limitation
+                _mark_inconclusive_scan_result(result, "recursion_limit_exceeded")
+                _finish_with_inconclusive_contract(result, default_success=True)
                 return result
 
             # Handle different types of parsing errors more gracefully
@@ -4769,7 +4824,14 @@ class PickleScanner(BaseScanner):
             and check.severity == IssueSeverity.CRITICAL
             for check in result.checks
         )
-        result.finish(success=scan_result.success and not has_critical_post_budget_failure)
+        if has_critical_post_budget_failure:
+            _finish_with_inconclusive_contract(result, default_success=False)
+        else:
+            _finish_with_inconclusive_contract(
+                result,
+                default_success=scan_result.success,
+                allow_security_findings_override=True,
+            )
         return result
 
     def _is_pickle_parse_failure(self, error: Exception) -> bool:
@@ -6026,8 +6088,11 @@ class PickleScanner(BaseScanner):
 
             timed_out = timeout_exceeded or time.time() > deadline
 
-            if opcode_budget_exceeded or timed_out:
-                result.metadata["analysis_incomplete"] = True
+            if opcode_budget_exceeded:
+                _mark_inconclusive_scan_result(result, "opcode_budget_exceeded")
+
+            if timed_out:
+                _mark_inconclusive_scan_result(result, "scan_timeout")
 
             if opcode_budget_exceeded:
                 result.add_check(
@@ -6054,7 +6119,11 @@ class PickleScanner(BaseScanner):
                     message=f"Scanning timed out after {self.timeout} seconds",
                     severity=IssueSeverity.INFO,
                     location=self.current_file_path,
-                    details={"opcode_count": opcode_count, "timeout": self.timeout},
+                    details={
+                        "opcode_count": opcode_count,
+                        "timeout": self.timeout,
+                        "analysis_incomplete": True,
+                    },
                     why=(
                         "The scan exceeded the configured time limit. Large or complex pickle files may take "
                         "longer to analyze due to the number of opcodes that need to be processed."
@@ -7455,6 +7524,7 @@ class PickleScanner(BaseScanner):
                         "analysis_incomplete": True,
                     }
                 )
+                _mark_inconclusive_scan_result(result, "memory_limit")
                 result.add_check(
                     name="Pickle Parse Resource Limit",
                     passed=False,
@@ -7488,6 +7558,7 @@ class PickleScanner(BaseScanner):
                         "scanner_limitation": True,
                     }
                 )
+                _mark_inconclusive_scan_result(result, "recursion_limit_exceeded")
                 # Add as info-level issue for transparency, not critical
                 result.add_check(
                     name="Recursion Depth Check",
@@ -7501,6 +7572,8 @@ class PickleScanner(BaseScanner):
                         "file_size": file_size,
                         "file_format": file_ext,
                         "max_recursion_depth": 1000,  # Python's default recursion limit
+                        "scanner_limitation": True,
+                        "analysis_incomplete": True,
                     },
                     why=(
                         "This model file contains complex nested structures that exceed the scanner's "
@@ -7524,6 +7597,7 @@ class PickleScanner(BaseScanner):
                         "scanner_limitation": True,
                     }
                 )
+                _mark_inconclusive_scan_result(result, "recursion_limit_exceeded")
                 # Add as debug, not critical - scanner limitation rather than security issue
                 result.add_check(
                     name="Recursion Depth Check",
@@ -7537,6 +7611,8 @@ class PickleScanner(BaseScanner):
                         "file_size": file_size,
                         "exception_type": "RecursionError",
                         "max_recursion_depth": 1000,  # Python's default recursion limit
+                        "scanner_limitation": True,
+                        "analysis_incomplete": True,
                     },
                     why=(
                         "The pickle file structure is too complex for the scanner to fully analyze due to "
@@ -7560,6 +7636,7 @@ class PickleScanner(BaseScanner):
                         "validated_format": True,
                     },
                 )
+                _mark_inconclusive_scan_result(result, "stream_integrity_limited")
                 # Still add as info-level issue for transparency
                 result.add_check(
                     name="Pickle Stream Integrity Check",
@@ -7574,6 +7651,7 @@ class PickleScanner(BaseScanner):
                         "file_format": file_ext,
                         "stream_complete": False,
                         "bytes_processed": opcode_count,
+                        "analysis_incomplete": True,
                     },
                     why=(
                         "This file contains data after the pickle STOP opcode or uses format features that cannot "
@@ -7648,7 +7726,7 @@ class PickleScanner(BaseScanner):
             with contextlib.suppress(NameError):
                 sys.setrecursionlimit(original_recursion_limit)  # type: ignore[possibly-unresolved-reference]
 
-        result.finish(success=not timed_out)
+        _finish_with_inconclusive_contract(result, default_success=not timed_out)
         return result
 
     def _is_legitimate_pytorch_model(self, path: str) -> bool:

@@ -16,7 +16,7 @@ from modelaudit.integrations.license_checker import (
 )
 from modelaudit.models import ModelAuditResultModel, ScanConfigModel, create_initial_audit_result
 from modelaudit.scanners import _registry
-from modelaudit.scanners.base import BaseScanner, IssueSeverity, ScanResult
+from modelaudit.scanners.base import INCONCLUSIVE_SCAN_OUTCOME, BaseScanner, IssueSeverity, ScanResult
 from modelaudit.telemetry import record_file_type_detected, record_issue_found, record_scanner_used
 from modelaudit.utils import is_within_directory, resolve_dvc_file, should_skip_file
 from modelaudit.utils.file.detection import (
@@ -51,6 +51,7 @@ logger = logging.getLogger("modelaudit.core")
 
 _OPERATIONAL_ERROR_METADATA_KEY = "operational_error"
 _OPERATIONAL_ERROR_REASON_METADATA_KEY = "operational_error_reason"
+_SCAN_OUTCOME_METADATA_KEY = "scan_outcome"
 
 HEADER_FORMAT_TO_SCANNER_ID = {
     "pickle": "pickle",
@@ -118,6 +119,48 @@ def _results_have_operational_error(results: ModelAuditResultModel) -> bool:
     return any(
         bool(metadata.get(_OPERATIONAL_ERROR_METADATA_KEY)) for metadata in (results.file_metadata or {}).values()
     )
+
+
+def _metadata_has_scan_outcome(metadata: Any, outcome: str) -> bool:
+    """Return True when metadata reports the requested scan outcome."""
+    if metadata is None:
+        return False
+    if isinstance(metadata, dict):
+        return metadata.get(_SCAN_OUTCOME_METADATA_KEY) == outcome
+
+    getter = getattr(metadata, "get", None)
+    if callable(getter):
+        try:
+            value = getter(_SCAN_OUTCOME_METADATA_KEY)
+            return bool(value == outcome)
+        except Exception:
+            return False
+
+    return getattr(metadata, _SCAN_OUTCOME_METADATA_KEY, None) == outcome
+
+
+def _results_have_inconclusive_outcome(results: ModelAuditResultModel) -> bool:
+    """Return True when any scanned file completed with an explicit inconclusive outcome."""
+    return any(
+        _metadata_has_scan_outcome(metadata, INCONCLUSIVE_SCAN_OUTCOME)
+        for metadata in (results.file_metadata or {}).values()
+    )
+
+
+def _results_have_security_findings(results: ModelAuditResultModel) -> bool:
+    """Return True when WARNING/CRITICAL issues were reported."""
+    return any(
+        hasattr(issue, "severity") and issue.severity in (IssueSeverity.WARNING, IssueSeverity.CRITICAL)
+        for issue in (results.issues or [])
+    )
+
+
+def _results_should_be_unsuccessful(results: ModelAuditResultModel) -> bool:
+    """Return True when the aggregate result should not be considered successful."""
+    if _results_have_operational_error(results):
+        return True
+
+    return _results_have_inconclusive_outcome(results) and not _results_have_security_findings(results)
 
 
 def _to_telemetry_severity(severity: Any) -> str:
@@ -244,7 +287,7 @@ def _add_issue_to_model(
     """Helper function to add an issue directly to the Pydantic model."""
     import time
 
-    from .scanners.base import Issue, IssueSeverity
+    from .scanners.base import Issue
 
     # Convert string severity to enum
     severity_enum = {
@@ -581,7 +624,6 @@ def _update_result_counts(
         consolidated_checks: List of consolidated checks
         original_count: Original number of checks before consolidation
     """
-    from .scanners.base import IssueSeverity
 
     # Filter for success rate: include all passed checks + failed WARNING/CRITICAL checks
     # Exclude failed INFO/DEBUG checks from success rate (they're informational)
@@ -815,7 +857,7 @@ def scan_model_directory_or_file(
             except Exception as e:
                 logger.warning(f"Error consolidating checks ({type(e).__name__}): {e!s}", exc_info=e)
             results.has_errors = bool(scan_metadata.get("has_operational_errors", False))
-            results.success = bool(scan_metadata.get("success", True)) and not results.has_errors
+            results.success = not _results_should_be_unsuccessful(results)
             results.finalize_statistics()
             return results
 
@@ -1205,7 +1247,7 @@ def scan_model_directory_or_file(
     results.has_errors = bool(scan_metadata.get("has_operational_errors", False) or not scan_metadata["success"])
 
     # Set success flag for backward compatibility
-    results.success = bool(scan_metadata.get("success", True)) and not results.has_errors
+    results.success = not _results_should_be_unsuccessful(results)
 
     # Compute aggregate content hash if we collected file hashes
     if file_hashes:
@@ -1227,8 +1269,9 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     Exit codes:
     - 0: Success, no security issues found
     - 1: Security issues found (scan completed successfully)
-    - 2: Operational errors occurred during scanning, or no files were scanned
-         and no security issues were found
+    - 2: Operational errors occurred during scanning, the scan outcome was
+         inconclusive without any WARNING/CRITICAL findings, or no files were
+         scanned and no security issues were found
 
     Args:
         results: ModelAuditResultModel with scan results
@@ -1240,22 +1283,13 @@ def determine_exit_code(results: ModelAuditResultModel) -> int:
     if _results_have_operational_error(results):
         return 2
 
-    # Check for any security findings before treating zero scanned files as
-    # an operational-style outcome. Path traversal and similar safeguards can
-    # report a finding before any file is scanned.
-    issues = results.issues or []
-    if issues:
-        # Filter out DEBUG and INFO level issues for exit code determination
-        # Only WARNING, ERROR (legacy), and CRITICAL issues should trigger exit code 1
-        from modelaudit.scanners.base import IssueSeverity
+    # Security findings take precedence over inconclusive outcomes so the
+    # caller still gets exit code 1 when genuine risks were identified.
+    if _results_have_security_findings(results):
+        return 1
 
-        security_issues = [
-            issue
-            for issue in issues
-            if hasattr(issue, "severity") and issue.severity in [IssueSeverity.WARNING, IssueSeverity.CRITICAL]
-        ]
-        if security_issues:
-            return 1
+    if _results_have_inconclusive_outcome(results):
+        return 2
 
     # Check if no files were scanned
     files_scanned = results.files_scanned
@@ -1804,7 +1838,7 @@ def scan_model_streaming(
 
         # Finalize statistics
         results.finalize_statistics()
-        results.success = not _results_have_operational_error(results)
+        results.success = not _results_should_be_unsuccessful(results)
 
     except Exception as e:
         logger.error(f"Streaming scan failed: {e}")

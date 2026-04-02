@@ -70,6 +70,8 @@ _KERAS_CONFIG_PREFIX_HINT_RE = re.compile(
     r'"(?:layers|input_layers|output_layers|build_config|compile_config|module|registered_name)"\s*:'
 )
 _PYTORCH_ZIP_METADATA_MAX_BYTES = 64
+_SKOPS_SCHEMA_ENTRIES = frozenset({"schema", "schema.json"})
+_SKOPS_SCHEMA_MAX_BYTES = 4 * 1024 * 1024
 _COMPRESSED_EXTENSION_CODECS = {
     ".gz": "gzip",
     ".bz2": "bzip2",
@@ -331,6 +333,28 @@ def _looks_like_keras_config(config_data: object) -> bool:
     return any(key in config_data for key in _KERAS_MODEL_TOP_LEVEL_HINTS)
 
 
+def _looks_like_skops_schema(schema_data: object) -> bool:
+    """Require enough schema structure to justify Skops-specific routing."""
+    if not isinstance(schema_data, dict):
+        return False
+
+    class_name = schema_data.get("__class__")
+    module_name = schema_data.get("__module__")
+    loader_name = schema_data.get("__loader__")
+    if not isinstance(class_name, str) or not class_name.strip():
+        return False
+    if not isinstance(module_name, str) or not module_name.strip():
+        return False
+    # Skops schema nodes are serialized as ObjectNode/ListNode/etc.
+    if not isinstance(loader_name, str) or not loader_name.endswith("Node"):
+        return False
+    if "content" not in schema_data:
+        return False
+
+    skops_version = schema_data.get("_skops_version")
+    return isinstance(skops_version, str) and bool(skops_version.strip())
+
+
 def _looks_like_keras_config_prefix(config_prefix: bytes) -> bool:
     """Best-effort Keras config sniffing for oversized JSON members."""
     try:
@@ -354,7 +378,7 @@ def _read_zip_member_text(
     try:
         data = _read_zip_member_bounded(archive, member_info, max_bytes)
         return data.decode("utf-8", errors="strict").strip()
-    except (OSError, UnicodeDecodeError, ValueError):
+    except (OSError, RuntimeError, UnicodeDecodeError, ValueError):
         return None
 
 
@@ -401,6 +425,7 @@ def is_torchserve_mar_archive(path: str) -> bool:
             return _looks_like_torchserve_manifest(manifest_data)
     except (
         OSError,
+        RuntimeError,
         ValueError,
         UnicodeDecodeError,
         json.JSONDecodeError,
@@ -443,18 +468,21 @@ def is_keras_zip_archive(path: str, *, allow_config_only: bool = False) -> bool:
 
             try:
                 config_data = json.loads(_read_zip_member_bounded(archive, config_info, _KERAS_ZIP_CONFIG_MAX_BYTES))
-            except (UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
                 if config_info.file_size > _KERAS_ZIP_CONFIG_MAX_BYTES:
-                    config_prefix = _read_zip_member_prefix(
-                        archive,
-                        config_info,
-                        _KERAS_ZIP_CONFIG_PREFIX_MAX_BYTES,
-                    )
+                    try:
+                        config_prefix = _read_zip_member_prefix(
+                            archive,
+                            config_info,
+                            _KERAS_ZIP_CONFIG_PREFIX_MAX_BYTES,
+                        )
+                    except (OSError, RuntimeError):
+                        return False
                     return _looks_like_keras_config_prefix(config_prefix)
                 return False
 
             return _looks_like_keras_config(config_data)
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
 
@@ -482,7 +510,7 @@ def is_pytorch_zip_archive(path: str) -> bool:
 
                 if _looks_like_pytorch_zip_metadata(archive, prefix):
                     return True
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
     return False
@@ -518,7 +546,43 @@ def is_executorch_archive(path: str) -> bool:
                 version_text = _read_zip_member_text(archive, version_info, _PYTORCH_ZIP_METADATA_MAX_BYTES)
                 if version_text is not None and re.fullmatch(r"\d+(?:\.\d+)?", version_text):
                     return True
-    except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
+        return False
+
+    return False
+
+
+def is_skops_archive(path: str) -> bool:
+    """Return whether a ZIP-backed file has a Skops schema payload.
+
+    Oversized schema members are treated as Skops to avoid failing open on
+    misnamed archives whose schema content cannot be safely parsed within the
+    bounded read limit.
+    """
+    file_path = Path(path)
+    if not file_path.is_file():
+        return False
+
+    try:
+        with zipfile.ZipFile(file_path, "r") as archive:
+            for info in archive.infolist():
+                if not info.filename or info.is_dir():
+                    continue
+
+                basename = PurePosixPath(_normalize_archive_member_name(info.filename)).name
+                if basename not in _SKOPS_SCHEMA_ENTRIES:
+                    continue
+                if info.file_size > _SKOPS_SCHEMA_MAX_BYTES:
+                    return True
+
+                try:
+                    schema_data = json.loads(_read_zip_member_bounded(archive, info, _SKOPS_SCHEMA_MAX_BYTES))
+                except (RuntimeError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+                    continue
+
+                if _looks_like_skops_schema(schema_data):
+                    return True
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile):
         return False
 
     return False

@@ -539,6 +539,30 @@ def test_coreml_scanner_recursion_limit_succeeds_just_below_limit(tmp_path: Path
     )
 
 
+def test_coreml_scanner_oversized_truncated_benign_layers_do_not_fail_closed(tmp_path: Path) -> None:
+    oversized_layer = _build_layer("safe_layer_" + "A" * (CoreMLScanner.MAX_PARSE_BYTES + 2048))
+    model_path = _write_model(
+        tmp_path / "oversized_truncated_benign.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            neural_network=_build_neural_network(layers=[oversized_layer]),
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is True
+    assert result.metadata.get("coreml_bounded_read_truncated") is True
+    assert not any(
+        issue.severity == IssueSeverity.CRITICAL and "Unable to parse CoreML neural network block" in issue.message
+        for issue in result.issues
+    )
+    assert any(
+        check.name == "CoreML Bounded Parse Window" and check.status.value == "passed" for check in result.checks
+    )
+    assert not any(check.name == "CoreML Custom Code Path Check" for check in result.checks)
+
+
 def test_coreml_scanner_malformed_custom_model_fails_closed(tmp_path: Path) -> None:
     model_path = _write_model(
         tmp_path / "malformed_custom_model.mlmodel",
@@ -576,6 +600,35 @@ def test_coreml_scanner_truncated_linked_model_file_fails_closed(tmp_path: Path)
         issue.severity == IssueSeverity.CRITICAL
         and "Unable to parse CoreML linked-model file entry" in issue.message
         and issue.details.get("field_path") == "model[556].linkedModelFile"
+        and issue.details.get("parse_error") == "truncated length-delimited field 1"
+        for issue in result.issues
+    )
+
+
+def test_coreml_scanner_truncated_nested_linked_model_fails_closed_without_bounded_read(tmp_path: Path) -> None:
+    malformed_nested_model = (
+        _field_varint(1, 8)
+        + _field_bytes(2, _build_description(metadata=_build_metadata()))
+        + _encode_varint((556 << 3) | 2)
+        + _encode_varint(8)
+        + b"\x0a\x05abc"
+    )
+    model_path = _write_model(
+        tmp_path / "nested_malformed_linked_model.mlmodel",
+        _build_model(
+            description=_build_description(metadata=_build_metadata()),
+            pipeline_wrapper=_build_pipeline_wrapper(malformed_nested_model),
+        ),
+    )
+
+    result = CoreMLScanner().scan(str(model_path))
+
+    assert result.success is False
+    assert result.metadata.get("coreml_bounded_read_truncated") is not True
+    assert any(
+        issue.severity == IssueSeverity.CRITICAL
+        and "Unable to parse CoreML linked-model block" in issue.message
+        and "][1:0][556]" in issue.details.get("field_path", "")
         and issue.details.get("parse_error") == "truncated length-delimited field 1"
         for issue in result.issues
     )

@@ -107,6 +107,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **pmml:** enforce max-file-size limits, inspect namespaced Extension/script tags, ignore DOCTYPE/ENTITY text inside XML comments/CDATA, avoid recursive text-walk crashes on deeply nested Extension trees, and fail closed when CRITICAL PMML findings are present
 - **gguf:** fall back to the GGUF spec default tensor-data alignment after rejecting invalid `general.alignment` metadata values
 - **security:** detect protocol 0/1 pickle streams hidden behind long separator gaps after an initial safe pickle stream
 - **security:** preserve failed status for malicious Skops CVE detections and avoid CVE-2025-54886 false positives on benign README/model-card text such as "download"
